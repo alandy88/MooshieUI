@@ -407,6 +407,7 @@ pub fn run() {
             commands::websocket::connect_ws,
             commands::websocket::disconnect_ws,
             commands::workflow::generate,
+            commands::workflow::submit_workflow,
             commands::workflow::generate_controlnet_preprocessor_preview,
             commands::config::get_config,
             commands::config::update_config,

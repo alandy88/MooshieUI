@@ -17,6 +17,7 @@
   import { loadOutputImageForGenerationInput, uploadOutputImageForGenerationInput } from "./lib/utils/galleryActions.js";
   import { generation } from "./lib/stores/generation.svelte.js";
   import { pipelineProfiles } from "./lib/stores/profiles.svelte.js";
+  import { userPresets } from "./lib/stores/presets.svelte.js";
   import { agent } from "./lib/stores/agent.svelte.js";
   import { results } from "./lib/stores/results.svelte.js";
   import { gate } from "./lib/stores/gate.svelte.js";
@@ -1588,6 +1589,8 @@
     // from current generation state, and register the chat streaming listeners.
     await pipelineProfiles.load();
     await pipelineProfiles.ensureDefault(generation.toSpec());
+    // User-preset Workflows (Phase 7): hydrate + re-register into the catalog.
+    await userPresets.load();
     void agent.init();
 
     // Set up event listeners BEFORE starting so we don't miss events

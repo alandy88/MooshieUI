@@ -82,6 +82,39 @@ pub async fn generate(
     })
 }
 
+/// Submit a pre-built ComfyUI API graph as-is (Phase 7 — user-preset Workflows).
+///
+/// The built-in path (`generate`) assembles the graph in Rust from
+/// `GenerationParams`; an imported user preset is instead filled by the
+/// client-side slot-injector (`workflows/inject.ts`) and arrives here already a
+/// complete graph. The seed is resolved client-side (so the injected `@slot:seed`
+/// value and the returned seed agree) and passed through for the Result record.
+#[tauri::command]
+pub async fn submit_workflow(
+    state: State<'_, Arc<AppState>>,
+    workflow: serde_json::Value,
+    seed: i64,
+) -> Result<GenerateResponse, AppError> {
+    crate::temp_images::cleanup(300);
+
+    let timeout = std::time::Duration::from_secs(300);
+    let (worker_id, response) = state
+        .gpu_manager
+        .submit_prompt(workflow, &state.client_id, timeout)
+        .await?;
+
+    state.prompt_queue.insert(&response.prompt_id, None);
+    state
+        .prompt_queue
+        .set_worker(&response.prompt_id, worker_id);
+    state.broadcast_queue_positions();
+
+    Ok(GenerateResponse {
+        prompt_id: response.prompt_id,
+        seed,
+    })
+}
+
 #[derive(serde::Serialize)]
 pub struct ControlNetPreprocessorPreviewResponse {
     pub prompt_id: String,

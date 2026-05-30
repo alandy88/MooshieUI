@@ -37,6 +37,19 @@ export async function generate(params: GenerationParams): Promise<GenerateRespon
 }
 
 /**
+ * Submit a client-injected user-preset graph as-is (Phase 7). The built-in path
+ * assembles in Rust from params; an imported preset is filled by the slot-injector
+ * (`workflows/inject.ts`) and submitted whole. `seed` is resolved client-side so
+ * the injected `@slot:seed` and the returned seed agree for the Result record.
+ */
+export async function submitWorkflow(
+  workflow: Record<string, unknown>,
+  seed: number,
+): Promise<GenerateResponse> {
+  return ipcInvoke("submit_workflow", { workflow, seed });
+}
+
+/**
  * Judge one produced image (Phase 5). Sends the base64 PNG + a judge prompt to
  * the agent runtime's vision endpoint; returns the model's reply (a fenced JSON
  * verdict the caller parses). One bounded call — the model judges, never loops.

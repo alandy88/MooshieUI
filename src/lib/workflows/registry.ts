@@ -62,6 +62,19 @@ export interface SlotDecl {
 
 export type WorkflowOrigin = "builtin" | "user-preset";
 
+/**
+ * The injectable payload a user-preset Workflow carries (Phase 7). Built-ins have
+ * none — they assemble in Rust. A preset stores its ComfyUI API graph plus the
+ * map from each declared slot to the node id that bears its `@slot:` tag, so the
+ * slot-injector (`workflows/inject.ts`) can fill it without re-parsing.
+ */
+export interface PresetPayload {
+  /** The imported ComfyUI API-format graph (nodeId → node). */
+  graph: Record<string, unknown>;
+  /** slot name → the node id tagged `@slot:<name>`. */
+  slotNodes: Partial<Record<SlotName, string>>;
+}
+
 /** A Workflow in the catalog: its identity, origin, and the slots it exposes. */
 export interface Workflow {
   /** Stable id; for built-ins this matches the Rust `templates/` module name. */
@@ -71,10 +84,14 @@ export interface Workflow {
   /**
    * The `mode` passed to the Rust `build_workflow` for a base Workflow, or `null`
    * for a feature pipeline (upscale / facefix / controlnet) that is layered onto
-   * a base graph via a toggle rather than selected standalone.
+   * a base graph via a toggle rather than selected standalone. A user preset runs
+   * through the slot-injector + raw submit, not `build_workflow`, so its `mode` is
+   * informational only.
    */
   mode: "txt2img" | "img2img" | "inpainting" | null;
   slots: SlotDecl[];
+  /** Present only for `origin: "user-preset"` — the graph + slot→node map. */
+  preset?: PresetPayload;
 }
 
 /** Slots every Workflow exposes (the core sampling + model points). */
@@ -153,7 +170,8 @@ export const BUILTIN_WORKFLOWS: Workflow[] = [
 
 const WORKFLOWS_BY_ID: Map<string, Workflow> = new Map(BUILTIN_WORKFLOWS.map((w) => [w.id, w]));
 
-/** All registered Workflows (built-ins now; user presets register here later). */
+/** All registered Workflows — built-ins and imported user presets, one catalog
+ *  (story 43: the Agent and Profiles select from a single list). */
 export function listWorkflows(): Workflow[] {
   return [...WORKFLOWS_BY_ID.values()];
 }
@@ -161,6 +179,31 @@ export function listWorkflows(): Workflow[] {
 /** Look up a Workflow by id, or `undefined` if not registered. */
 export function getWorkflow(id: string): Workflow | undefined {
   return WORKFLOWS_BY_ID.get(id);
+}
+
+/**
+ * Register (or replace) a user-preset Workflow into the shared catalog (Phase 7).
+ * Built-in ids are protected — a preset can never shadow `txt2img` et al. Returns
+ * the registered Workflow. The presets store calls this on import and on hydrate.
+ */
+export function registerWorkflow(workflow: Workflow): Workflow {
+  const existing = WORKFLOWS_BY_ID.get(workflow.id);
+  if (existing && existing.origin === "builtin") {
+    throw new Error(`Cannot override built-in Workflow "${workflow.id}".`);
+  }
+  WORKFLOWS_BY_ID.set(workflow.id, workflow);
+  return workflow;
+}
+
+/** Remove a user-preset Workflow from the catalog. Built-ins are never removed. */
+export function unregisterWorkflow(id: string): void {
+  const existing = WORKFLOWS_BY_ID.get(id);
+  if (existing && existing.origin === "user-preset") WORKFLOWS_BY_ID.delete(id);
+}
+
+/** Whether an id is already taken (built-in or an imported preset). */
+export function workflowIdExists(id: string): boolean {
+  return WORKFLOWS_BY_ID.has(id);
 }
 
 /**

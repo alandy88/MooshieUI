@@ -7,7 +7,7 @@ import { styles } from "./styles.svelte.js";
 import { promptPresets } from "./promptPresets.svelte.js";
 import { STYLE_PRESETS, type StylePreset, type StylePresetId } from "../spec/stylePresets.ts";
 import { specFromFields, fieldsFromSpec, type GenerationFields } from "../spec/projection.ts";
-import { specToParams, type ModelArchitecture } from "../spec/specToParams.ts";
+import { specToParams, resolveSlotValues, type ModelArchitecture, type SpecToParamsInjections } from "../spec/specToParams.ts";
 import type { ResolvedSpec } from "../spec/spec.ts";
 
 const STORE_KEY = "generation-settings";
@@ -1134,7 +1134,14 @@ class GenerationStore {
    * pure assembler. The order of the singleton calls below is preserved from the
    * original so the wildcard-roll / active-preset advance side effects are unchanged.
    */
-  toParams(options: GenerationToParamsOptions = {}) {
+  /**
+   * Resolve the rune-bound / non-deterministic contributions the pure assembler
+   * needs (inline `@preset:` rolls, the active Artist Styles fragment, active
+   * Prompt Presets). Shared by `toParams` (built-in path) and `toSlotValues` (the
+   * Phase 7 preset slot-injector path) so both see identical resolution; the
+   * singleton call order is preserved so wildcard-roll side effects are unchanged.
+   */
+  private resolveInjections(options: GenerationToParamsOptions = {}): SpecToParamsInjections {
     // Expand inline `@preset:<slug>` directives in the user-typed prompts first,
     // so wildcard rolls happen before any merging/dedup. Each occurrence rolls
     // independently.
@@ -1159,7 +1166,7 @@ class GenerationStore {
       advanceFixedOrdered: false,
     });
 
-    return specToParams(this.toSpec(), {
+    return {
       styleFragment,
       resolvedPresets: {
         inlinePositive,
@@ -1168,7 +1175,26 @@ class GenerationStore {
         append: preset.append,
       },
       architecture: this.detectedArchitecture,
-    });
+    };
+  }
+
+  /**
+   * Thin wrapper over the pure `specToParams` assembler: resolve the rune-bound /
+   * non-deterministic contributions, then hand a resolved Spec + those injections
+   * to the pure assembler.
+   */
+  toParams(options: GenerationToParamsOptions = {}) {
+    return specToParams(this.toSpec(), this.resolveInjections(options));
+  }
+
+  /**
+   * Path-neutral resolved slot-values for the current Spec — what the user-preset
+   * slot-injector (`workflows/inject.ts`) consumes (Phase 7). The same resolution
+   * `toParams` does, stopped one step earlier at the neutral values (the ADR 0003
+   * assembly seam) instead of the snake_case built-in params.
+   */
+  toSlotValues(options: GenerationToParamsOptions = {}) {
+    return resolveSlotValues(this.toSpec(), this.resolveInjections(options));
   }
 
   addLora() {

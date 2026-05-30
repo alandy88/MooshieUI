@@ -2368,6 +2368,39 @@ async fn dispatch_command(
                 "queue_total": queue_total,
             }))
         }
+        "submit_workflow" => {
+            // Phase 7 — submit a client-injected user-preset graph as-is. A
+            // straightforward submit (no built-in assembly); the single-operator
+            // preset run does not need the fair-queue placeholder path `generate`
+            // uses for multi-user LAN sessions.
+            crate::temp_images::cleanup(300);
+
+            let workflow = args["workflow"].clone();
+            if !workflow.is_object() {
+                return Err("submit_workflow needs a ComfyUI API graph object.".into());
+            }
+            let seed = args["seed"].as_i64().unwrap_or(-1);
+
+            let timeout = std::time::Duration::from_secs(300);
+            let (worker_id, response) = state
+                .gpu_manager
+                .submit_prompt(workflow, &state.client_id, timeout)
+                .await
+                .map_err(|e| e.to_string())?;
+
+            state
+                .prompt_queue
+                .insert(&response.prompt_id, username.map(|s| s.to_string()));
+            state
+                .prompt_queue
+                .set_worker(&response.prompt_id, worker_id);
+            state.broadcast_queue_positions();
+
+            Ok(serde_json::json!({
+                "prompt_id": response.prompt_id,
+                "seed": seed,
+            }))
+        }
         "generate_controlnet_preprocessor_preview" => {
             crate::temp_images::cleanup(300);
 

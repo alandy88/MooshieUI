@@ -10,6 +10,7 @@
   import GenerateButton from "./GenerateButton.svelte";
   import ChatPanel from "../agent/ChatPanel.svelte";
   import ResultBoard from "../agent/ResultBoard.svelte";
+  import PresetPanel from "../agent/PresetPanel.svelte";
   import { results } from "../../stores/results.svelte.js";
   import type { Result } from "../../spec/result.ts";
   import UpscaleSettings from "./UpscaleSettings.svelte";
@@ -827,6 +828,8 @@
   let chatOpen = $state(
     typeof window !== "undefined" && localStorage.getItem(CHAT_OPEN_KEY) === "true",
   );
+  /** Workflow-presets drawer in the agent column (Phase 7). */
+  let presetsOpen = $state(false);
   $effect(() => {
     try { localStorage.setItem(CHAT_OPEN_KEY, String(chatOpen)); } catch {}
   });
@@ -1994,6 +1997,21 @@
         <div class="shrink-0 h-full overflow-hidden flex flex-col" style="width: 360px">
           <div class="flex-1 min-h-0 overflow-hidden">
             <ChatPanel />
+          </div>
+          <!-- Workflow presets drawer (Phase 7) -->
+          <div class="shrink-0 border-t border-neutral-800 bg-neutral-950">
+            <button
+              onclick={() => (presetsOpen = !presetsOpen)}
+              class="flex w-full items-center gap-1 px-3 py-1.5 text-[11px] text-neutral-400 hover:text-neutral-200"
+              title="Import / run custom ComfyUI preset Workflows"
+            >
+              <span class="transition-transform {presetsOpen ? 'rotate-90' : ''}">▸</span> Workflow presets
+            </button>
+            {#if presetsOpen}
+              <div class="max-h-[40vh] overflow-y-auto border-t border-neutral-900">
+                <PresetPanel />
+              </div>
+            {/if}
           </div>
           {#if results.results.length > 0 || results.pending.length > 0}
             <div class="h-[44%] min-h-0 shrink-0 overflow-hidden border-t border-neutral-800">
