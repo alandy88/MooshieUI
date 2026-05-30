@@ -18,6 +18,7 @@ import { ipcInvoke, ipcListen } from "../utils/ipc.js";
 import { pipelineProfiles, DEFAULT_PROFILE_ID } from "./profiles.svelte.js";
 import { generation } from "./generation.svelte.js";
 import { results } from "./results.svelte.js";
+import { gate } from "./gate.svelte.js";
 import { buildSystemPrompt, extractRequestSpec, type ProfileChoice, type BoardContext } from "../agent/prompt.js";
 import { validateRequestSpec } from "../spec/validate.ts";
 import { mergeIntoResolved, applyRefineDelta, profileDefaultsFromResolved, type RequestSpec } from "../spec/merge.ts";
@@ -232,6 +233,7 @@ class AgentStore {
     this.specApplied = false;
     this.currentRequestId = null;
     results.reset();
+    gate.reset();
   }
 }
 

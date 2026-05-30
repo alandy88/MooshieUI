@@ -19,6 +19,7 @@
   import { pipelineProfiles } from "./lib/stores/profiles.svelte.js";
   import { agent } from "./lib/stores/agent.svelte.js";
   import { results } from "./lib/stores/results.svelte.js";
+  import { gate } from "./lib/stores/gate.svelte.js";
   import { autocomplete } from "./lib/stores/autocomplete.svelte.js";
   import { canvas } from "./lib/stores/canvas.svelte.js";
   import { accessibility } from "./lib/stores/accessibility.svelte.js";
@@ -1155,6 +1156,12 @@
         seed: mintedResults[0].seed,
         parent: mintedResults[0].parent ?? null,
       });
+    }
+
+    // Judge + gate each new Result when enabled — deterministic app code drives
+    // this; the model only returns the verdict (Phase 5, ADR 0002).
+    if (gate.judgingEnabled) {
+      for (const r of mintedResults) void gate.judgeAndGate(r);
     }
     for (const image of newImages) {
       image.metadata = metadata ?? null;

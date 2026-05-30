@@ -159,3 +159,73 @@ pub async fn agent_chat(
 ) -> Result<(), AppError> {
     run_agent_chat(&state, messages, request_id).await
 }
+
+/// Run a single non-streaming **vision** completion — the Phase 5 judge (ADR
+/// 0002: judgment only). The frontend sends the produced image (base64 PNG) plus
+/// a judge prompt carrying the Result's intent/prompt; the model returns a fenced
+/// JSON verdict the frontend parses. This is one bounded call, never a loop.
+///
+/// Returns the assistant message content verbatim (the frontend extracts and
+/// validates the verdict, mirroring the chat path's client-side parsing).
+pub async fn run_agent_judge(
+    state: &AppState,
+    image_base64: String,
+    prompt: String,
+) -> Result<String, AppError> {
+    let (base_url, api_key, model) = {
+        let config = state.config.read().await;
+        (
+            config.agent_base_url.trim_end_matches('/').to_string(),
+            config.agent_api_key.clone(),
+            config.agent_model.clone(),
+        )
+    };
+
+    let url = format!("{base_url}/chat/completions");
+    let data_url = format!("data:image/png;base64,{image_base64}");
+    let body = serde_json::json!({
+        "model": model,
+        "stream": false,
+        "temperature": 0,
+        "messages": [{
+            "role": "user",
+            "content": [
+                { "type": "text", "text": prompt },
+                { "type": "image_url", "image_url": { "url": data_url } }
+            ]
+        }],
+    });
+
+    let mut req = state.http_client.post(&url).json(&body);
+    if let Some(key) = api_key.as_deref() {
+        if !key.trim().is_empty() {
+            req = req.bearer_auth(key.trim());
+        }
+    }
+
+    let resp = req.send().await.map_err(AppError::HttpError)?;
+    if !resp.status().is_success() {
+        let status = resp.status().as_u16();
+        let detail = resp.text().await.unwrap_or_default();
+        return Err(AppError::ApiError { status, message: detail });
+    }
+
+    let value: serde_json::Value = resp.json().await.map_err(AppError::HttpError)?;
+    let content = value["choices"][0]["message"]["content"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    Ok(content)
+}
+
+/// Judge one produced image (desktop/Tauri command). Returns the model's reply
+/// (a fenced JSON verdict the frontend parses).
+#[cfg(feature = "desktop")]
+#[tauri::command]
+pub async fn agent_judge(
+    state: State<'_, Arc<AppState>>,
+    image_base64: String,
+    prompt: String,
+) -> Result<String, AppError> {
+    run_agent_judge(&state, image_base64, prompt).await
+}

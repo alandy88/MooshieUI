@@ -1596,6 +1596,14 @@ async fn dispatch_command(
                 .map_err(|e| e.to_string())?;
             Ok(serde_json::json!(null))
         }
+        "agent_judge" => {
+            let image_base64 = args["imageBase64"].as_str().unwrap_or_default().to_string();
+            let prompt = args["prompt"].as_str().unwrap_or_default().to_string();
+            let content = crate::commands::agent::run_agent_judge(&state, image_base64, prompt)
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(serde_json::json!(content))
+        }
         // --- Config ---
         "get_config" => {
             let config = state.config.read().await;

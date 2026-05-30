@@ -36,6 +36,15 @@ export async function generate(params: GenerationParams): Promise<GenerateRespon
   return ipcInvoke("generate", { params });
 }
 
+/**
+ * Judge one produced image (Phase 5). Sends the base64 PNG + a judge prompt to
+ * the agent runtime's vision endpoint; returns the model's reply (a fenced JSON
+ * verdict the caller parses). One bounded call — the model judges, never loops.
+ */
+export async function judgeImage(imageBase64: string, prompt: string): Promise<string> {
+  return ipcInvoke("agent_judge", { imageBase64, prompt });
+}
+
 export interface ControlNetPreprocessorPreviewResponse {
   prompt_id: string;
 }
