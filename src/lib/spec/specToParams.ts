@@ -10,7 +10,13 @@
  *
  * Only (3) lives here, and (1)+(2) are passed in as `injections` (dependency
  * injection) so this function is pure and headless-testable. The store's
- * `toParams()` becomes a thin wrapper that does (1)+(2) then calls this.
+ * `toParams()` is a thin wrapper that does (1)+(2) then calls this.
+ *
+ * Two-step (ADR 0003): `resolveSlotValues` produces *path-neutral resolved
+ * slot-values* (camelCase, target-agnostic), then `slotValuesToParams` maps them
+ * to the snake_case `GenerationParams` the built-in Rust builders consume. The
+ * neutral layer is the seam a future user-preset slot-injector targets instead —
+ * the Spec→values rules are path-neutral; only the final injection step differs.
  *
  * The built-in style-preset lookup and the per-architecture quality-tag rules
  * ARE deterministic, so they stay here (driven by the resolved Spec + the
@@ -18,6 +24,7 @@
  */
 
 import type { ResolvedSpec } from "./spec.ts";
+import type { PromptSegment } from "../types/index.ts";
 import { STYLE_PRESETS } from "./stylePresets.ts";
 import { mergeTagPrompts, translateNaiWeightSyntax } from "./promptAssembly.ts";
 import { parseScheduledPrompt } from "../utils/promptSchedule.ts";
@@ -53,8 +60,8 @@ export interface ResolvedPresetText {
 }
 
 /**
- * Everything `specToParams` needs that the resolved Spec does NOT carry — the
- * rune-read / non-deterministic pieces the wrapper resolves first.
+ * Everything `resolveSlotValues` needs that the resolved Spec does NOT carry —
+ * the rune-read / non-deterministic pieces the wrapper resolves first.
  */
 export interface SpecToParamsInjections {
   /** Artist-Styles fragment (`styles.buildPromptFragment()`); `""` if none. */
@@ -65,12 +72,67 @@ export interface SpecToParamsInjections {
   architecture: ModelArchitecture;
 }
 
+/** A LoRA in path-neutral form (camelCase, before the snake_case payload mapping). */
+export interface ResolvedLoraSlot {
+  name: string;
+  strengthModel: number;
+  strengthClip: number;
+}
+
 /**
- * Assemble the ComfyUI generation params from a resolved Spec + injected
- * rune-read context. Pure: identical inputs ⇒ identical output (the byte-diff
- * guarantee). The shape is byte-identical to the legacy `toParams()` return.
+ * Path-neutral resolved slot-values — the target-agnostic intermediate the
+ * Spec→values rules produce. Either the built-in Rust builders (via
+ * `slotValuesToParams`) or a future preset slot-injector consume these.
  */
-export function specToParams(spec: ResolvedSpec, injections: SpecToParamsInjections) {
+export interface ResolvedSlotValues {
+  mode: "txt2img" | "img2img" | "inpainting";
+  /** Assembled base prompt text, scheduling tags stripped + NAI-weight translated. */
+  positivePrompt: string;
+  negativePrompt: string;
+  positiveSegments: PromptSegment[];
+  negativeSegments: PromptSegment[];
+  /** Raw assembled prompt (scheduling tags intact) for metadata embedding. */
+  rawPositivePrompt: string;
+  rawNegativePrompt: string;
+  /** Quality-only prompts for tiled-upscale seam reduction (null when not applicable). */
+  upscalePositivePrompt: string | null;
+  upscaleNegativePrompt: string | null;
+  checkpoint: string;
+  loras: ResolvedLoraSlot[];
+  sampler: string;
+  scheduler: string;
+  steps: number;
+  cfg: number;
+  seed: number;
+  width: number;
+  height: number;
+  batch: number;
+  denoise: number;
+  differentialDiffusion: boolean;
+  inputImage: string | null;
+  maskImage: string | null;
+  growMaskBy: number;
+  smartGuidance: boolean;
+  fluxGuidance: number;
+  // Structured pipeline blocks pass through neutrally (already resolved on the Spec).
+  upscale: ResolvedSpec["pipeline"]["upscale"];
+  splitModel: ResolvedSpec["pipeline"]["splitModel"];
+  controlnet: ResolvedSpec["pipeline"]["controlnet"];
+  facefix: ResolvedSpec["pipeline"]["facefix"];
+  output: ResolvedSpec["pipeline"]["output"];
+  architecture: ModelArchitecture;
+}
+
+/**
+ * Resolve a Spec + injected rune-context into path-neutral slot-values. Pure:
+ * identical inputs ⇒ identical output. This is where the deterministic prompt
+ * assembly (built-in styles, Artist-Styles fragment, prompt presets, per-family
+ * quality tags, scheduling + NAI-weight translation) happens.
+ */
+export function resolveSlotValues(
+  spec: ResolvedSpec,
+  injections: SpecToParamsInjections,
+): ResolvedSlotValues {
   const { styleFragment, resolvedPresets, architecture } = injections;
   const isAnima = architecture === "anima";
   const isIllustrious = architecture === "illustrious";
@@ -153,84 +215,134 @@ export function specToParams(spec: ResolvedSpec, injections: SpecToParamsInjecti
   const parsedPositive = parseScheduledPrompt(positivePrompt);
   const parsedNegative = parseScheduledPrompt(negativePrompt);
 
-  const controlnet = spec.pipeline.controlnet;
-
   return {
-    mode: spec.workflow as "txt2img" | "img2img" | "inpainting",
-    positive_prompt: translateNaiWeightSyntax(parsedPositive.baseText),
-    negative_prompt: translateNaiWeightSyntax(parsedNegative.baseText),
-    positive_segments: parsedPositive.segments.map((s) => ({
+    mode: spec.workflow as ResolvedSlotValues["mode"],
+    positivePrompt: translateNaiWeightSyntax(parsedPositive.baseText),
+    negativePrompt: translateNaiWeightSyntax(parsedNegative.baseText),
+    positiveSegments: parsedPositive.segments.map((s) => ({
       text: translateNaiWeightSyntax(s.text),
       start: s.start,
       end: s.end,
     })),
-    negative_segments: parsedNegative.segments.map((s) => ({
+    negativeSegments: parsedNegative.segments.map((s) => ({
       text: translateNaiWeightSyntax(s.text),
       start: s.start,
       end: s.end,
     })),
-    raw_positive_prompt: translateNaiWeightSyntax(positivePrompt),
-    raw_negative_prompt: translateNaiWeightSyntax(negativePrompt),
+    rawPositivePrompt: translateNaiWeightSyntax(positivePrompt),
+    rawNegativePrompt: translateNaiWeightSyntax(negativePrompt),
+    upscalePositivePrompt,
+    upscaleNegativePrompt,
     checkpoint: spec.model.checkpoint,
-    vae: spec.pipeline.splitModel.vae,
     loras: spec.model.loras
       .filter((l) => l.enabled && l.name)
-      .map(({ name, strengthModel, strengthClip }) => ({
-        name,
-        strength_model: strengthModel,
-        strength_clip: strengthClip,
-      })),
-    sampler_name: spec.sampling.sampler,
+      .map((l) => ({ name: l.name, strengthModel: l.strengthModel, strengthClip: l.strengthClip })),
+    sampler: spec.sampling.sampler,
     scheduler: spec.sampling.scheduler,
     steps: spec.sampling.steps,
     cfg: spec.sampling.cfg,
     seed: spec.sampling.seed,
     width: spec.dimensions.width,
     height: spec.dimensions.height,
-    batch_size: spec.dimensions.batch,
+    batch: spec.dimensions.batch,
     denoise: spec.sampling.denoise,
-    differential_diffusion: spec.input.differentialDiffusion,
-    input_image: spec.input.image,
-    mask_image: spec.input.mask,
-    grow_mask_by: spec.input.growMaskBy,
-    upscale_enabled: upscale.enabled,
-    upscale_method: upscale.method,
-    upscale_model: upscale.model,
-    upscale_scale: upscale.scale,
-    upscale_denoise: upscale.denoise,
-    upscale_steps: upscale.steps,
-    upscale_tile_size: upscale.tileSize,
-    upscale_tiling: upscale.tiling,
-    upscale_soft_guidance: upscale.softGuidance,
-    upscale_soft_guidance_multiplier: upscale.softGuidanceMultiplier,
-    smart_guidance: spec.pipeline.guidance.smart,
-    flux_guidance: spec.pipeline.guidance.flux,
-    upscale_positive_prompt: upscalePositivePrompt,
-    upscale_negative_prompt: upscaleNegativePrompt,
-    use_split_model: spec.pipeline.splitModel.enabled,
-    diffusion_model: spec.pipeline.splitModel.diffusionModel,
-    clip_model: spec.pipeline.splitModel.clipModel,
-    clip_type: spec.pipeline.splitModel.clipType,
-    controlnet: controlnet.enabled
+    differentialDiffusion: spec.input.differentialDiffusion,
+    inputImage: spec.input.image,
+    maskImage: spec.input.mask,
+    growMaskBy: spec.input.growMaskBy,
+    smartGuidance: spec.pipeline.guidance.smart,
+    fluxGuidance: spec.pipeline.guidance.flux,
+    upscale,
+    splitModel: spec.pipeline.splitModel,
+    controlnet: spec.pipeline.controlnet,
+    facefix: spec.pipeline.facefix,
+    output: spec.pipeline.output,
+    architecture,
+  };
+}
+
+/**
+ * Map path-neutral slot-values to the snake_case `GenerationParams` object the
+ * built-in Rust template builders consume. Byte-identical to the legacy
+ * `toParams()` return shape (guarded by the byte-diff test).
+ */
+export function slotValuesToParams(s: ResolvedSlotValues) {
+  return {
+    mode: s.mode,
+    positive_prompt: s.positivePrompt,
+    negative_prompt: s.negativePrompt,
+    positive_segments: s.positiveSegments,
+    negative_segments: s.negativeSegments,
+    raw_positive_prompt: s.rawPositivePrompt,
+    raw_negative_prompt: s.rawNegativePrompt,
+    checkpoint: s.checkpoint,
+    vae: s.splitModel.vae,
+    loras: s.loras.map(({ name, strengthModel, strengthClip }) => ({
+      name,
+      strength_model: strengthModel,
+      strength_clip: strengthClip,
+    })),
+    sampler_name: s.sampler,
+    scheduler: s.scheduler,
+    steps: s.steps,
+    cfg: s.cfg,
+    seed: s.seed,
+    width: s.width,
+    height: s.height,
+    batch_size: s.batch,
+    denoise: s.denoise,
+    differential_diffusion: s.differentialDiffusion,
+    input_image: s.inputImage,
+    mask_image: s.maskImage,
+    grow_mask_by: s.growMaskBy,
+    upscale_enabled: s.upscale.enabled,
+    upscale_method: s.upscale.method,
+    upscale_model: s.upscale.model,
+    upscale_scale: s.upscale.scale,
+    upscale_denoise: s.upscale.denoise,
+    upscale_steps: s.upscale.steps,
+    upscale_tile_size: s.upscale.tileSize,
+    upscale_tiling: s.upscale.tiling,
+    upscale_soft_guidance: s.upscale.softGuidance,
+    upscale_soft_guidance_multiplier: s.upscale.softGuidanceMultiplier,
+    smart_guidance: s.smartGuidance,
+    flux_guidance: s.fluxGuidance,
+    upscale_positive_prompt: s.upscalePositivePrompt,
+    upscale_negative_prompt: s.upscaleNegativePrompt,
+    use_split_model: s.splitModel.enabled,
+    diffusion_model: s.splitModel.diffusionModel,
+    clip_model: s.splitModel.clipModel,
+    clip_type: s.splitModel.clipType,
+    controlnet: s.controlnet.enabled
       ? {
           enabled: true,
-          preset: controlnet.mode === "preset" ? controlnet.preset : null,
-          controlnet_model: controlnet.model,
-          preprocessor: controlnet.mode === "preset" ? controlnet.preprocessor : null,
-          image: controlnet.image,
-          strength: controlnet.strength,
-          start_percent: controlnet.startPercent,
-          end_percent: controlnet.endPercent,
+          preset: s.controlnet.mode === "preset" ? s.controlnet.preset : null,
+          controlnet_model: s.controlnet.model,
+          preprocessor: s.controlnet.mode === "preset" ? s.controlnet.preprocessor : null,
+          image: s.controlnet.image,
+          strength: s.controlnet.strength,
+          start_percent: s.controlnet.startPercent,
+          end_percent: s.controlnet.endPercent,
         }
       : null,
-    facefix_enabled: spec.pipeline.facefix.enabled,
-    facefix_detector: spec.pipeline.facefix.detector,
-    facefix_denoise: spec.pipeline.facefix.denoise,
-    facefix_steps: spec.pipeline.facefix.steps,
-    facefix_guide_size: spec.pipeline.facefix.guideSize,
-    facefix_max_faces: spec.pipeline.facefix.maxFaces,
-    model_architecture: architecture,
-    output_bit_depth: spec.pipeline.output.bitDepth,
-    output_format: spec.pipeline.output.format,
+    facefix_enabled: s.facefix.enabled,
+    facefix_detector: s.facefix.detector,
+    facefix_denoise: s.facefix.denoise,
+    facefix_steps: s.facefix.steps,
+    facefix_guide_size: s.facefix.guideSize,
+    facefix_max_faces: s.facefix.maxFaces,
+    model_architecture: s.architecture,
+    output_bit_depth: s.output.bitDepth,
+    output_format: s.output.format,
   };
+}
+
+/**
+ * Assemble the ComfyUI generation params from a resolved Spec + injected
+ * rune-read context. Pure: identical inputs ⇒ identical output (the byte-diff
+ * guarantee). Composes the neutral slot-value resolution with the built-in
+ * params mapping.
+ */
+export function specToParams(spec: ResolvedSpec, injections: SpecToParamsInjections) {
+  return slotValuesToParams(resolveSlotValues(spec, injections));
 }
