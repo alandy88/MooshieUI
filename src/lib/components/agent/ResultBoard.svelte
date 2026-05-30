@@ -3,7 +3,9 @@
   import { progress } from "../../stores/progress.svelte.js";
   import { generation } from "../../stores/generation.svelte.js";
   import { gate } from "../../stores/gate.svelte.js";
+  import { orchestrator } from "../../stores/orchestrator.svelte.js";
   import { applyRefineDelta } from "../../spec/merge.ts";
+  import type { FanoutPlan } from "../../orchestrator/fanout.ts";
   import type { GatePolicy } from "../../orchestrator/gate.ts";
   import type { Result } from "../../spec/result.ts";
 
@@ -68,6 +70,30 @@
     gate.hold(result.id);
     results.select(result.id);
   }
+
+  // ── Fan-out (Phase 6): seed sweeps + outfit axis over the current Spec ────────
+  let showFanout = $state(false);
+  let sweepCount = $state(4);
+  let outfitsText = $state("");
+
+  /** Parse the outfit box (one fragment per line or comma) into a clean list. */
+  function parsedOutfits(): string[] {
+    return outfitsText
+      .split(/[\n,]/)
+      .map((s) => s.trim())
+      .filter(Boolean);
+  }
+
+  function fanoutPlan(): FanoutPlan {
+    const outfits = parsedOutfits();
+    return { seedsPerItem: Math.max(1, sweepCount), outfits: outfits.length ? outfits : undefined };
+  }
+
+  /** Launch the fan-out run from the current control-panel Spec. */
+  function runFanout() {
+    if (orchestrator.running) return;
+    void orchestrator.run(generation.toSpec(), fanoutPlan());
+  }
 </script>
 
 <div class="flex h-full flex-col bg-neutral-950 text-neutral-100">
@@ -102,6 +128,51 @@
           class="w-12 rounded bg-neutral-900 border border-neutral-700 px-1 py-0.5 text-neutral-200"
         />
       </label>
+    {/if}
+  </div>
+
+  <!-- Fan-out: deterministic seed/outfit sweeps over the current Spec (Phase 6) -->
+  <div class="border-b border-neutral-800 px-3 py-1.5 shrink-0 text-[11px] text-neutral-400">
+    <div class="flex items-center gap-2">
+      <button type="button" onclick={() => (showFanout = !showFanout)} class="flex items-center gap-1 hover:text-neutral-200" title="Fan out the current Spec across seeds / outfits">
+        <span class="transition-transform {showFanout ? 'rotate-90' : ''}">▸</span> Fan-out
+      </button>
+      {#if orchestrator.running}
+        <span class="ml-auto flex items-center gap-1.5 text-indigo-300">
+          <span class="h-2.5 w-2.5 animate-spin rounded-full border border-neutral-600 border-t-indigo-400"></span>
+          {orchestrator.done}/{orchestrator.total}
+        </span>
+        <button type="button" onclick={() => orchestrator.cancel()} class="rounded bg-red-800/80 px-2 py-0.5 text-white hover:bg-red-700">stop</button>
+      {:else}
+        <button
+          type="button"
+          onclick={runFanout}
+          class="ml-auto rounded bg-indigo-600 px-2 py-0.5 text-white hover:bg-indigo-500"
+          title="Submit one Spec per item through the shared generate path"
+        >Run ×{orchestrator.previewSize(fanoutPlan())}</button>
+      {/if}
+    </div>
+
+    {#if showFanout}
+      <div class="mt-2 flex flex-col gap-2">
+        <label class="flex items-center gap-2" title="Images per item — the seed axis (story 34)">
+          seeds
+          <input type="number" min="1" max="64" bind:value={sweepCount}
+            class="w-14 rounded bg-neutral-900 border border-neutral-700 px-1 py-0.5 text-neutral-200" />
+          <span class="text-neutral-600">× {parsedOutfits().length || 1} outfit(s)</span>
+        </label>
+        <label class="flex flex-col gap-1" title="One outfit per line or comma — each becomes a Spec with these tags merged into the prompt">
+          outfits (optional)
+          <textarea bind:value={outfitsText} rows="2" placeholder="school uniform&#10;red dress"
+            class="resize-none rounded bg-neutral-900 border border-neutral-700 px-2 py-1 text-neutral-200 placeholder:text-neutral-600"></textarea>
+        </label>
+      </div>
+    {/if}
+
+    {#if orchestrator.failures.length > 0}
+      <div class="mt-1.5 text-amber-400">
+        {orchestrator.failures.length} item(s) failed (one bad item won't sink the batch)
+      </div>
     {/if}
   </div>
 
