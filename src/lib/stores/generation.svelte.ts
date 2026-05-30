@@ -1,11 +1,14 @@
 import { ipcStore } from "../utils/ipc.js";
 import { triggerSync } from "../utils/syncTrigger.js";
-import { parseScheduledPrompt } from "../utils/promptSchedule.js";
 import type { LoraEntry } from "../types/index.js";
 import { autocomplete } from "./autocomplete.svelte.js";
 import { signalsIndicateAnima } from "../utils/modelFamily.js";
 import { styles } from "./styles.svelte.js";
 import { promptPresets } from "./promptPresets.svelte.js";
+import { STYLE_PRESETS, type StylePreset, type StylePresetId } from "../spec/stylePresets.ts";
+import { specFromFields, fieldsFromSpec, type GenerationFields } from "../spec/projection.ts";
+import { specToParams, type ModelArchitecture } from "../spec/specToParams.ts";
+import type { Spec } from "../spec/spec.ts";
 
 const STORE_KEY = "generation-settings";
 const PROMPT_HISTORY_KEY = "mooshieui.promptHistory.v1";
@@ -13,36 +16,6 @@ const MAX_PROMPT_HISTORY = 100;
 
 export interface GenerationToParamsOptions {
   fixedPresetChoices?: ReadonlyMap<string, string>;
-}
-
-/**
- * Translate NAI-style weight brackets to ComfyUI (tag:weight) syntax.
- * - {text} → (text:1.05)   — each layer multiplies by 1.05
- * - [text] → (text:0.9524)  — each layer divides by 1.05
- * - 1.1::text:: → (text:1.1) — A1111-style weight prefix
- * Processes innermost brackets first, so nesting works: {{tag}} → ((tag:1.05):1.05)
- */
-function translateNaiWeightSyntax(prompt: string): string {
-  // Process A1111-style weight::text:: syntax first
-  prompt = prompt.replace(/(\d+\.?\d*)::([^:]+)::/g, (_m, weight, text) => {
-    return `(${text.trim()}:${parseFloat(weight).toFixed(2)})`;
-  });
-
-  // Process innermost {text} → (text:1.05) repeatedly
-  let prev: string;
-  do {
-    prev = prompt;
-    prompt = prompt.replace(/\{([^{}]+)\}/g, (_m, inner) => `(${inner}:1.05)`);
-  } while (prompt !== prev);
-
-  // Process innermost [text] → (text:0.95) repeatedly
-  // Skip escaped brackets \[ and \]
-  do {
-    prev = prompt;
-    prompt = prompt.replace(/(?<!\\)\[([^\[\]]+)\]/g, (_m, inner) => `(${inner}:0.95)`);
-  } while (prompt !== prev);
-
-  return prompt;
 }
 
 /**
@@ -69,8 +42,6 @@ function pickSplitModelVae(diffusionModel: string | null, vaes: string[]): strin
   }
   return vaes.find((v) => v.toLowerCase().includes("sdxl_vae")) ?? vaes[0];
 }
-
-type StylePresetId = "none" | "anime" | "cinematic" | "photoreal" | "digital_art" | "line_art";
 
 const GENERATION_MODES = ["txt2img", "img2img", "inpainting"] as const;
 type GenerationMode = (typeof GENERATION_MODES)[number];
@@ -132,13 +103,6 @@ function normalizeModeToggles(value: unknown): ModeToggleStates {
   return normalized;
 }
 
-interface StylePreset {
-  id: StylePresetId;
-  label: string;
-  positive: string;
-  negative: string;
-}
-
 interface PromptHistoryEntry {
   id: string;
   positivePrompt: string;
@@ -148,45 +112,6 @@ interface PromptHistoryEntry {
   createdAt: number;
   favorite: boolean;
 }
-
-const STYLE_PRESETS: StylePreset[] = [
-  {
-    id: "none",
-    label: "None",
-    positive: "",
-    negative: "",
-  },
-  {
-    id: "anime",
-    label: "Anime",
-    positive: "anime style, vibrant colors, clean linework, detailed illustration",
-    negative: "photo, realistic skin texture, grainy"
-  },
-  {
-    id: "cinematic",
-    label: "Cinematic",
-    positive: "cinematic lighting, dramatic composition, film still, volumetric light",
-    negative: "flat lighting, low contrast"
-  },
-  {
-    id: "photoreal",
-    label: "Photoreal",
-    positive: "photorealistic, ultra-detailed, natural lighting, high dynamic range",
-    negative: "cartoon, anime, painting, cgi"
-  },
-  {
-    id: "digital_art",
-    label: "Digital Art",
-    positive: "digital painting, concept art, painterly details, high detail",
-    negative: "low detail, flat colors"
-  },
-  {
-    id: "line_art",
-    label: "Line Art",
-    positive: "line art, clean outlines, monochrome illustration",
-    negative: "heavy shading, photorealistic texture, noisy background"
-  },
-];
 
 /** Default quality tags for Anima models */
 export const DEFAULT_ANIMA_POSITIVE_QUALITY = "newest, masterpiece, best quality, score_9, score_8, safe, highres";
@@ -438,7 +363,7 @@ class GenerationStore {
   }
 
   /** Detect the base model architecture from modelspec (authoritative) or filename (fallback). */
-  get detectedArchitecture(): "sdxl" | "illustrious" | "sd15" | "sd3" | "flux" | "pony" | "auraflow" | "pixart" | "hunyuandit" | "cascade" | "kolors" | "mugen" | "nanosaur" | "anima" | "unknown" {
+  get detectedArchitecture(): ModelArchitecture {
     const name = (this.diffusionModel ?? this.checkpoint ?? "").toLowerCase();
 
     if (signalsIndicateAnima(this.modelFamilySignals())) {
@@ -517,29 +442,6 @@ class GenerationStore {
     return STYLE_PRESETS;
   }
 
-  private splitTags(text: string): string[] {
-    return text
-      .split(",")
-      .map((part) => part.trim())
-      .filter((part) => !!part);
-  }
-
-  private mergeTagPrompts(base: string, extra: string): string {
-    if (!extra) return base;
-    const existing = this.splitTags(base);
-    const seen = new Set(existing.map((tag) => tag.toLowerCase()));
-    const merged = [...existing];
-
-    for (const tag of this.splitTags(extra)) {
-      const normalized = tag.toLowerCase();
-      if (!seen.has(normalized)) {
-        seen.add(normalized);
-        merged.push(tag);
-      }
-    }
-
-    return merged.join(", ");
-  }
 
   private loadPromptHistory() {
     try {
@@ -1071,14 +973,171 @@ class GenerationStore {
     }
   }
 
-  toParams(options: GenerationToParamsOptions = {}) {
-    const style = this.stylePresetsEnabled
-      ? (STYLE_PRESETS.find((preset) => preset.id === this.stylePreset) ?? STYLE_PRESETS[0])
-      : STYLE_PRESETS[0];
+  /**
+   * Plain (rune-free) snapshot of the param-relevant store fields. Mirrors
+   * `GenerationFields`; the seam through which the store exchanges a Spec.
+   */
+  snapshot(): GenerationFields {
+    return {
+      mode: this.mode,
+      positivePrompt: this.positivePrompt,
+      negativePrompt: this.negativePrompt,
+      stylePreset: this.stylePreset,
+      stylePresetsEnabled: this.stylePresetsEnabled,
+      checkpoint: this.checkpoint,
+      vae: this.vae,
+      loras: this.loras,
+      samplerName: this.samplerName,
+      scheduler: this.scheduler,
+      steps: this.steps,
+      cfg: this.cfg,
+      seed: this.seed,
+      width: this.width,
+      height: this.height,
+      batchSize: this.batchSize,
+      denoise: this.denoise,
+      inputImage: this.inputImage,
+      maskImage: this.maskImage,
+      growMaskBy: this.growMaskBy,
+      differentialDiffusion: this.differentialDiffusion,
+      upscaleEnabled: this.upscaleEnabled,
+      upscaleMethod: this.upscaleMethod,
+      upscaleModel: this.upscaleModel,
+      upscaleScale: this.upscaleScale,
+      upscaleDenoise: this.upscaleDenoise,
+      upscaleSteps: this.upscaleSteps,
+      upscaleTileSize: this.upscaleTileSize,
+      upscaleTiling: this.upscaleTiling,
+      upscaleSoftGuidance: this.upscaleSoftGuidance,
+      upscaleSoftGuidanceMultiplier: this.upscaleSoftGuidanceMultiplier,
+      smartGuidance: this.smartGuidance,
+      fluxGuidance: this.fluxGuidance,
+      useSplitModel: this.useSplitModel,
+      diffusionModel: this.diffusionModel,
+      clipModel: this.clipModel,
+      clipType: this.clipType,
+      controlnetEnabled: this.controlnetEnabled,
+      controlnetMode: this.controlnetMode,
+      controlnetPreset: this.controlnetPreset,
+      controlnetModel: this.controlnetModel,
+      controlnetPreprocessor: this.controlnetPreprocessor,
+      controlnetImage: this.controlnetImage,
+      controlnetStrength: this.controlnetStrength,
+      controlnetStartPercent: this.controlnetStartPercent,
+      controlnetEndPercent: this.controlnetEndPercent,
+      facefixEnabled: this.facefixEnabled,
+      facefixDetector: this.facefixDetector,
+      facefixDenoise: this.facefixDenoise,
+      facefixSteps: this.facefixSteps,
+      facefixGuideSize: this.facefixGuideSize,
+      facefixMaxFaces: this.facefixMaxFaces,
+      outputBitDepth: this.outputBitDepth,
+      outputFormat: this.outputFormat,
+      metadataMode: this.metadataMode,
+      autoQualityTags: this.autoQualityTags,
+      customAnimaPositiveQuality: this.customAnimaPositiveQuality,
+      customAnimaNegativeQuality: this.customAnimaNegativeQuality,
+      customIllustriousPositiveQuality: this.customIllustriousPositiveQuality,
+      customIllustriousNegativeQuality: this.customIllustriousNegativeQuality,
+      customPonyPositiveQuality: this.customPonyPositiveQuality,
+      customPonyNegativeQuality: this.customPonyNegativeQuality,
+      customNanosaurPositiveQuality: this.customNanosaurPositiveQuality,
+      customNanosaurNegativeQuality: this.customNanosaurNegativeQuality,
+    };
+  }
 
-    // Expand inline `@preset:<slug>` directives in the user-typed prompts
-    // first, so wildcard rolls happen before any merging/dedup logic. Each
-    // occurrence rolls independently.
+  /** Project the current store state into a Spec (store → Spec). */
+  toSpec(): Spec {
+    return specFromFields(this.snapshot());
+  }
+
+  /**
+   * Apply a Spec onto the store fields (Spec → store projection) — the inverse
+   * of `toSpec`. Sets `_mode` directly (the Spec already carries the per-mode
+   * toggle fields, so the `setMode` toggle-swap must not run), then records the
+   * applied toggles for the active mode.
+   */
+  applySpec(spec: Spec): void {
+    const f = fieldsFromSpec(spec);
+    this._mode = f.mode;
+    this.positivePrompt = f.positivePrompt;
+    this.negativePrompt = f.negativePrompt;
+    this.stylePreset = f.stylePreset as StylePresetId;
+    this.stylePresetsEnabled = f.stylePresetsEnabled;
+    this.checkpoint = f.checkpoint;
+    this.vae = f.vae;
+    this.loras = f.loras;
+    this.samplerName = f.samplerName;
+    this.scheduler = f.scheduler;
+    this.steps = f.steps;
+    this.cfg = f.cfg;
+    this.seed = f.seed;
+    this.width = f.width;
+    this.height = f.height;
+    this.batchSize = f.batchSize;
+    this.denoise = f.denoise;
+    this.inputImage = f.inputImage;
+    this.maskImage = f.maskImage;
+    this.growMaskBy = f.growMaskBy;
+    this.differentialDiffusion = f.differentialDiffusion;
+    this.upscaleEnabled = f.upscaleEnabled;
+    this.upscaleMethod = f.upscaleMethod;
+    this.upscaleModel = f.upscaleModel;
+    this.upscaleScale = f.upscaleScale;
+    this.upscaleDenoise = f.upscaleDenoise;
+    this.upscaleSteps = f.upscaleSteps;
+    this.upscaleTileSize = f.upscaleTileSize;
+    this.upscaleTiling = f.upscaleTiling;
+    this.upscaleSoftGuidance = f.upscaleSoftGuidance;
+    this.upscaleSoftGuidanceMultiplier = f.upscaleSoftGuidanceMultiplier;
+    this.smartGuidance = f.smartGuidance;
+    this.fluxGuidance = f.fluxGuidance;
+    this.useSplitModel = f.useSplitModel;
+    this.diffusionModel = f.diffusionModel;
+    this.clipModel = f.clipModel;
+    this.clipType = f.clipType;
+    this.controlnetEnabled = f.controlnetEnabled;
+    this.controlnetMode = f.controlnetMode;
+    this.controlnetPreset = f.controlnetPreset;
+    this.controlnetModel = f.controlnetModel;
+    this.controlnetPreprocessor = f.controlnetPreprocessor;
+    this.controlnetImage = f.controlnetImage;
+    this.controlnetStrength = f.controlnetStrength;
+    this.controlnetStartPercent = f.controlnetStartPercent;
+    this.controlnetEndPercent = f.controlnetEndPercent;
+    this.facefixEnabled = f.facefixEnabled;
+    this.facefixDetector = f.facefixDetector;
+    this.facefixDenoise = f.facefixDenoise;
+    this.facefixSteps = f.facefixSteps;
+    this.facefixGuideSize = f.facefixGuideSize;
+    this.facefixMaxFaces = f.facefixMaxFaces;
+    this.outputBitDepth = f.outputBitDepth;
+    this.outputFormat = f.outputFormat;
+    this.metadataMode = f.metadataMode;
+    this.autoQualityTags = f.autoQualityTags;
+    this.customAnimaPositiveQuality = f.customAnimaPositiveQuality;
+    this.customAnimaNegativeQuality = f.customAnimaNegativeQuality;
+    this.customIllustriousPositiveQuality = f.customIllustriousPositiveQuality;
+    this.customIllustriousNegativeQuality = f.customIllustriousNegativeQuality;
+    this.customPonyPositiveQuality = f.customPonyPositiveQuality;
+    this.customPonyNegativeQuality = f.customPonyNegativeQuality;
+    this.customNanosaurPositiveQuality = f.customNanosaurPositiveQuality;
+    this.customNanosaurNegativeQuality = f.customNanosaurNegativeQuality;
+    this.modeToggles = { ...this.modeToggles, [this._mode]: this.readModeToggleState() };
+  }
+
+  /**
+   * Thin wrapper over the pure `specToParams` assembler: resolve the rune-bound /
+   * non-deterministic contributions (inline `@preset:` rolls, the active Artist
+   * Styles fragment, active Prompt Presets — all of which read singletons and
+   * roll wildcards randomly), then hand a resolved Spec + those injections to the
+   * pure assembler. The order of the singleton calls below is preserved from the
+   * original so the wildcard-roll / active-preset advance side effects are unchanged.
+   */
+  toParams(options: GenerationToParamsOptions = {}) {
+    // Expand inline `@preset:<slug>` directives in the user-typed prompts first,
+    // so wildcard rolls happen before any merging/dedup. Each occurrence rolls
+    // independently.
     const inlinePositiveIds = promptPresets.inlinePresetIds(this.positivePrompt);
     const inlineNegativeIds = promptPresets.inlinePresetIds(this.negativePrompt);
     const inlinePresetIds = new Set([...inlinePositiveIds, ...inlineNegativeIds]);
@@ -1089,161 +1148,27 @@ class GenerationStore {
       fixedChoices: options.fixedPresetChoices,
     });
 
-    let positivePrompt = this.mergeTagPrompts(inlinePositive, style.positive);
-    let negativePrompt = this.mergeTagPrompts(inlineNegative, style.negative);
-
-    // Inject tags contributed by any currently-active Artist Styles. These are
-    // not visible in the prompt textbox — they flow straight into the payload
-    // so the user sees badges in the UI instead.
+    // Tags contributed by currently-active Artist Styles (not shown in the textbox).
     const styleFragment = styles.buildPromptFragment();
-    if (styleFragment) {
-      positivePrompt = this.mergeTagPrompts(positivePrompt, styleFragment);
-    }
 
-    // Inject active Prompt Presets (prepend / append / wildcard). Wildcards
-    // pick a random choice per generation — mergeTagPrompts dedupes against
-    // whatever the user has already typed.
+    // Active Prompt Presets (prepend / append / wildcard). Wildcards pick a random
+    // choice per generation unless pinned via fixedPresetChoices.
     const preset = promptPresets.resolve({
       fixedChoices: options.fixedPresetChoices,
       skipIds: inlinePresetIds,
       advanceFixedOrdered: false,
     });
-    if (preset.prepend) {
-      positivePrompt = this.mergeTagPrompts(preset.prepend, positivePrompt);
-    }
-    if (preset.append) {
-      positivePrompt = this.mergeTagPrompts(positivePrompt, preset.append);
-    }
 
-    // Auto-apply quality tags for supported model families
-    if (this.autoQualityTags) {
-      // Anima models (positive before, negative after)
-      if (this.isAnima) {
-        positivePrompt = this.mergeTagPrompts(this.customAnimaPositiveQuality, positivePrompt);
-        negativePrompt = this.mergeTagPrompts(negativePrompt, this.customAnimaNegativeQuality);
-      }
-
-      // Illustrious/NoobAI family (positive before, negative after)
-      if (this.isIllustrious) {
-        positivePrompt = this.mergeTagPrompts(this.customIllustriousPositiveQuality, positivePrompt);
-        negativePrompt = this.mergeTagPrompts(negativePrompt, this.customIllustriousNegativeQuality);
-      }
-
-      // Pony Diffusion (score-based quality tags)
-      if (this.isPony) {
-        positivePrompt = this.mergeTagPrompts(this.customPonyPositiveQuality, positivePrompt);
-        negativePrompt = this.mergeTagPrompts(negativePrompt, this.customPonyNegativeQuality);
-      }
-
-      // Nanosaur (newest/oldest quality tags)
-      if (this.isNanosaur) {
-        positivePrompt = this.mergeTagPrompts(this.customNanosaurPositiveQuality, positivePrompt);
-        negativePrompt = this.mergeTagPrompts(negativePrompt, this.customNanosaurNegativeQuality);
-      }
-    }
-
-    // Build quality-only prompts for tiled upscale (reduces tile seam artifacts)
-    let upscalePositivePrompt: string | null = null;
-    let upscaleNegativePrompt: string | null = null;
-    if (this.upscaleEnabled && this.upscaleTiling && this.autoQualityTags) {
-      if (this.isAnima) {
-        upscalePositivePrompt = this.customAnimaPositiveQuality;
-        upscaleNegativePrompt = this.customAnimaNegativeQuality;
-      } else if (this.isIllustrious) {
-        upscalePositivePrompt = this.customIllustriousPositiveQuality;
-        upscaleNegativePrompt = this.customIllustriousNegativeQuality;
-      } else if (this.isPony) {
-        upscalePositivePrompt = this.customPonyPositiveQuality;
-        upscaleNegativePrompt = this.customPonyNegativeQuality;
-      } else if (this.isNanosaur) {
-        upscalePositivePrompt = this.customNanosaurPositiveQuality;
-        upscaleNegativePrompt = this.customNanosaurNegativeQuality;
-      }
-    }
-
-    // Parse timestep scheduling tags from prompts before NAI weight translation
-    const parsedPositive = parseScheduledPrompt(positivePrompt);
-    const parsedNegative = parseScheduledPrompt(negativePrompt);
-
-    return {
-      mode: this.mode,
-      positive_prompt: translateNaiWeightSyntax(parsedPositive.baseText),
-      negative_prompt: translateNaiWeightSyntax(parsedNegative.baseText),
-      positive_segments: parsedPositive.segments.map((s) => ({
-        text: translateNaiWeightSyntax(s.text),
-        start: s.start,
-        end: s.end,
-      })),
-      negative_segments: parsedNegative.segments.map((s) => ({
-        text: translateNaiWeightSyntax(s.text),
-        start: s.start,
-        end: s.end,
-      })),
-      raw_positive_prompt: translateNaiWeightSyntax(positivePrompt),
-      raw_negative_prompt: translateNaiWeightSyntax(negativePrompt),
-      checkpoint: this.checkpoint,
-      vae: this.vae || null,
-      loras: this.loras
-        .filter((l) => l.enabled && l.name)
-        .map(({ name, strength_model, strength_clip }) => ({
-          name,
-          strength_model,
-          strength_clip,
-        })),
-      sampler_name: this.samplerName,
-      scheduler: this.scheduler,
-      steps: this.steps,
-      cfg: this.cfg,
-      seed: this.seed,
-      width: this.width,
-      height: this.height,
-      batch_size: this.batchSize,
-      denoise: this.denoise,
-      differential_diffusion: this.differentialDiffusion,
-      input_image: this.inputImage,
-      mask_image: this.maskImage,
-      grow_mask_by: this.growMaskBy,
-      upscale_enabled: this.upscaleEnabled,
-      upscale_method: this.upscaleMethod,
-      upscale_model: this.upscaleModel,
-      upscale_scale: this.upscaleScale,
-      upscale_denoise: this.upscaleDenoise,
-      upscale_steps: this.upscaleSteps,
-      upscale_tile_size: this.upscaleTileSize,
-      upscale_tiling: this.upscaleTiling,
-      upscale_soft_guidance: this.upscaleSoftGuidance,
-      upscale_soft_guidance_multiplier: this.upscaleSoftGuidanceMultiplier,
-      smart_guidance: this.smartGuidance,
-      flux_guidance: this.fluxGuidance,
-      upscale_positive_prompt: upscalePositivePrompt,
-      upscale_negative_prompt: upscaleNegativePrompt,
-      use_split_model: this.useSplitModel,
-      diffusion_model: this.diffusionModel,
-      clip_model: this.clipModel,
-      clip_type: this.clipType,
-      controlnet: this.controlnetEnabled
-        ? {
-            enabled: true,
-            preset: this.controlnetMode === "preset" ? this.controlnetPreset : null,
-            controlnet_model: this.controlnetModel,
-            preprocessor:
-              this.controlnetMode === "preset" ? this.controlnetPreprocessor : null,
-            image: this.controlnetImage,
-            strength: this.controlnetStrength,
-            start_percent: this.controlnetStartPercent,
-            end_percent: this.controlnetEndPercent,
-          }
-        : null,
-      facefix_enabled: this.facefixEnabled,
-      facefix_detector: this.facefixDetector,
-      facefix_denoise: this.facefixDenoise,
-      facefix_steps: this.facefixSteps,
-      facefix_guide_size: this.facefixGuideSize,
-      facefix_max_faces: this.facefixMaxFaces,
-      model_architecture: this.detectedArchitecture,
-      output_bit_depth: this.outputBitDepth,
-      output_format: this.outputFormat,
-    };
+    return specToParams(this.toSpec(), {
+      styleFragment,
+      resolvedPresets: {
+        inlinePositive,
+        inlineNegative,
+        prepend: preset.prepend,
+        append: preset.append,
+      },
+      architecture: this.detectedArchitecture,
+    });
   }
 
   addLora() {
