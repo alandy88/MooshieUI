@@ -1,0 +1,5 @@
+# Workflow layer = slot-injection over a registry of built-in + user ComfyUI presets
+
+A Workflow (the ComfyUI graph for one operation) is filled by injecting a resolved Spec's values into declared slots. Two origins coexist: the existing Rust `templates/` builders are the built-in Workflows (preserving Anima split-model VAE handling, per-architecture defaults, the facefix chain), and imported user ComfyUI presets are additional Workflows that declare injectable points via explicit `@slot:` node-title tags. A lightweight registry catalogs both; `specToParams` emits path-neutral slot-values consumed by either the Rust builder or a preset slot-injector.
+
+We chose coexist over *replacing* the Rust builders (which would forfeit their baked-in correctness) and over *inferring* slots from node types (fragile on custom nodes). The slot model is designed now but the preset importer is deferred — v1 runs on the built-ins so nothing hardcodes the Rust path. Reversing toward a single procedural assembler later would re-close the door to user-authored graphs.
