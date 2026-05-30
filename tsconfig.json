@@ -9,7 +9,9 @@
     "checkJs": true,
     "isolatedModules": true,
     "moduleDetection": "force",
-    "verbatimModuleSyntax": true
+    "verbatimModuleSyntax": true,
+    "allowImportingTsExtensions": true,
+    "types": ["node"]
   },
   "include": ["src/**/*.ts", "src/**/*.svelte"]
 }
