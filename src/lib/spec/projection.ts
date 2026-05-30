@@ -18,7 +18,7 @@
  */
 
 import type { LoraEntry } from "../types/index.ts";
-import type { Spec, SpecLora } from "./spec.ts";
+import type { ResolvedSpec, SpecLora } from "./spec.ts";
 
 /** Param-relevant snapshot of the generation store. Mirrors `$state` field names. */
 export interface GenerationFields {
@@ -179,7 +179,7 @@ function loraFromSpec(l: SpecLora): LoraEntry {
 }
 
 /** store → Spec. Single-cast txt2img: characters are prompt-encoded ⇒ cast = []. */
-export function specFromFields(f: GenerationFields): Spec {
+export function specFromFields(f: GenerationFields): ResolvedSpec {
   return {
     task: f.mode === "txt2img" ? "generate" : "edit",
     intent: null,
@@ -274,7 +274,7 @@ export function specFromFields(f: GenerationFields): Spec {
 }
 
 /** Spec → store projection. Inverse of `specFromFields` on this slice. */
-export function fieldsFromSpec(s: Spec): GenerationFields {
+export function fieldsFromSpec(s: ResolvedSpec): GenerationFields {
   return {
     mode: s.workflow as GenerationFields["mode"],
     positivePrompt: s.subject.positive,

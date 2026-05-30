@@ -39,7 +39,7 @@ export interface SpecLora {
   enabled: boolean;
 }
 
-export interface Spec {
+export interface ResolvedSpec {
   // ── orchestration-clean ──────────────────────────────────────────────────
   task: "generate" | "edit";
   intent: string | null;             // free-text the user asked for (provenance/judge)

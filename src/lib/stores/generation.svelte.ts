@@ -8,7 +8,7 @@ import { promptPresets } from "./promptPresets.svelte.js";
 import { STYLE_PRESETS, type StylePreset, type StylePresetId } from "../spec/stylePresets.ts";
 import { specFromFields, fieldsFromSpec, type GenerationFields } from "../spec/projection.ts";
 import { specToParams, type ModelArchitecture } from "../spec/specToParams.ts";
-import type { Spec } from "../spec/spec.ts";
+import type { ResolvedSpec } from "../spec/spec.ts";
 
 const STORE_KEY = "generation-settings";
 const PROMPT_HISTORY_KEY = "mooshieui.promptHistory.v1";
@@ -1046,8 +1046,8 @@ class GenerationStore {
     };
   }
 
-  /** Project the current store state into a Spec (store → Spec). */
-  toSpec(): Spec {
+  /** Project the current store state into a ResolvedSpec (store → Spec). */
+  toSpec(): ResolvedSpec {
     return specFromFields(this.snapshot());
   }
 
@@ -1057,7 +1057,7 @@ class GenerationStore {
    * toggle fields, so the `setMode` toggle-swap must not run), then records the
    * applied toggles for the active mode.
    */
-  applySpec(spec: Spec): void {
+  applySpec(spec: ResolvedSpec): void {
     const f = fieldsFromSpec(spec);
     this._mode = f.mode;
     this.positivePrompt = f.positivePrompt;

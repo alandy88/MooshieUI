@@ -17,7 +17,7 @@
  * injected `architecture`).
  */
 
-import type { Spec } from "./spec.ts";
+import type { ResolvedSpec } from "./spec.ts";
 import { STYLE_PRESETS } from "./stylePresets.ts";
 import { mergeTagPrompts, translateNaiWeightSyntax } from "./promptAssembly.ts";
 import { parseScheduledPrompt } from "../utils/promptSchedule.ts";
@@ -70,7 +70,7 @@ export interface SpecToParamsInjections {
  * rune-read context. Pure: identical inputs ⇒ identical output (the byte-diff
  * guarantee). The shape is byte-identical to the legacy `toParams()` return.
  */
-export function specToParams(spec: Spec, injections: SpecToParamsInjections) {
+export function specToParams(spec: ResolvedSpec, injections: SpecToParamsInjections) {
   const { styleFragment, resolvedPresets, architecture } = injections;
   const isAnima = architecture === "anima";
   const isIllustrious = architecture === "illustrious";
