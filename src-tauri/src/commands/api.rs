@@ -127,6 +127,36 @@ pub async fn get_history(
 
 #[cfg(feature = "desktop")]
 #[tauri::command]
+pub async fn recover_prompt_outputs(
+    state: State<'_, Arc<AppState>>,
+    prompt_id: String,
+) -> Result<Value, AppError> {
+    let ids = state.prompt_queue.related_ids(&prompt_id);
+    let mut cached = Vec::new();
+    {
+        let mut outputs = state.output_image_cache.write().unwrap();
+        for id in &ids {
+            if let Some(files) = outputs.remove(id) {
+                cached.extend(files);
+            }
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    cached.retain(|f| seen.insert(f.clone()));
+    let mut images: Vec<serde_json::Value> = cached
+        .into_iter()
+        .map(|f| serde_json::json!({ "temp_filename": f }))
+        .collect();
+    // Regional inpaint chains may cache multiple outputs per prompt; use the latest.
+    if images.len() > 1 {
+        let last = images.pop().unwrap();
+        images = vec![last];
+    }
+    Ok(serde_json::json!({ "images": images }))
+}
+
+#[cfg(feature = "desktop")]
+#[tauri::command]
 pub async fn interrupt_generation(
     state: State<'_, Arc<AppState>>,
     prompt_id: Option<String>,
@@ -276,6 +306,20 @@ fn is_structured_model_dir(path: &std::path::Path) -> bool {
         .any(|subdir| path.join(subdir).is_dir())
 }
 
+/// When the user points at a ComfyUI install root (with `models/checkpoints`
+/// etc. nested one level down), normalize to the `models` folder so structured
+/// category subdirs resolve correctly.
+pub(crate) fn resolve_extra_model_root(path: &std::path::Path) -> std::path::PathBuf {
+    if is_structured_model_dir(path) {
+        return path.to_path_buf();
+    }
+    let nested = path.join("models");
+    if nested.is_dir() && is_structured_model_dir(&nested) {
+        return nested;
+    }
+    path.to_path_buf()
+}
+
 fn classify_flat_model_dir(path: &std::path::Path) -> &'static str {
     let name = path
         .file_name()
@@ -304,6 +348,7 @@ fn classify_flat_model_dir(path: &std::path::Path) -> &'static str {
     } else if name.contains("clip")
         || name.contains("text_encoder")
         || name.contains("text-encoder")
+        || name.contains("textencoder") // StabilityMatrix
     {
         "text_encoders"
     } else if name.contains("unet") || name.contains("diffusion") {
@@ -354,13 +399,13 @@ pub(crate) fn model_install_dirs_for_config(
 
     if let Some(extra) = extra_model_paths {
         for line in extra.lines().map(|s| s.trim()).filter(|s| !s.is_empty()) {
-            let base = std::path::Path::new(line);
+            let base = resolve_extra_model_root(std::path::Path::new(line));
             let base_label = base
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_else(|| line.to_string());
 
-            if is_structured_model_dir(base) {
+            if is_structured_model_dir(&base) {
                 for subdir in category_subdirs(category) {
                     let candidate = base.join(subdir);
                     if candidate.is_dir() {
@@ -372,7 +417,7 @@ pub(crate) fn model_install_dirs_for_config(
                         push_model_install_dir(&mut dirs, &mut seen, candidate, label);
                     }
                 }
-            } else if classify_flat_model_dir(base) == category {
+            } else if classify_flat_model_dir(&base) == category {
                 push_model_install_dir(&mut dirs, &mut seen, base.to_path_buf(), base_label);
             }
         }
@@ -803,20 +848,31 @@ pub async fn save_to_gallery(
     metadata_mode: Option<String>,
 ) -> Result<String, AppError> {
     let bytes = state.get_output_image_bytes(&filename, &subfolder).await?;
-    save_to_gallery_inner(
+    let saved = save_to_gallery_inner(
         &bytes,
         &filename,
         &prompt_id,
         mode.as_deref(),
         metadata.as_ref(),
         metadata_mode.as_deref(),
-    )
+    )?;
+    let payload = serde_json::json!({
+        "filename": saved,
+        "prompt_id": prompt_id,
+        "mode": mode,
+        "source_filename": filename,
+        "metadata": metadata,
+    });
+    state.broadcast("mooshie:image_saved", payload.clone());
+    let _ = state.dispatch_webhook_event("image_saved", payload).await;
+    Ok(saved)
 }
 
 /// Save raw image bytes (from WebSocket) directly to the gallery with optional embedded metadata.
 #[cfg(feature = "desktop")]
 #[tauri::command]
 pub async fn save_to_gallery_bytes(
+    state: State<'_, Arc<AppState>>,
     image_bytes: Vec<u8>,
     filename: String,
     prompt_id: String,
@@ -824,14 +880,24 @@ pub async fn save_to_gallery_bytes(
     metadata: Option<std::collections::HashMap<String, String>>,
     metadata_mode: Option<String>,
 ) -> Result<String, AppError> {
-    save_to_gallery_inner(
+    let saved = save_to_gallery_inner(
         &image_bytes,
         &filename,
         &prompt_id,
         mode.as_deref(),
         metadata.as_ref(),
         metadata_mode.as_deref(),
-    )
+    )?;
+    let payload = serde_json::json!({
+        "filename": saved,
+        "prompt_id": prompt_id,
+        "mode": mode,
+        "source_filename": filename,
+        "metadata": metadata,
+    });
+    state.broadcast("mooshie:image_saved", payload.clone());
+    let _ = state.dispatch_webhook_event("image_saved", payload).await;
+    Ok(saved)
 }
 
 /// Save a temp image to the gallery (avoids re-serialising large byte arrays
@@ -839,6 +905,7 @@ pub async fn save_to_gallery_bytes(
 #[cfg(feature = "desktop")]
 #[tauri::command]
 pub async fn save_to_gallery_temp(
+    state: State<'_, Arc<AppState>>,
     temp_filename: String,
     filename: String,
     prompt_id: String,
@@ -848,14 +915,122 @@ pub async fn save_to_gallery_temp(
 ) -> Result<String, AppError> {
     let bytes = crate::temp_images::load(&temp_filename)
         .ok_or_else(|| AppError::Other(format!("Temp image not found: {}", temp_filename)))?;
-    save_to_gallery_inner(
+    let saved = save_to_gallery_inner(
         &bytes,
         &filename,
         &prompt_id,
         mode.as_deref(),
         metadata.as_ref(),
         metadata_mode.as_deref(),
-    )
+    )?;
+    let payload = serde_json::json!({
+        "filename": saved,
+        "prompt_id": prompt_id,
+        "mode": mode,
+        "source_filename": filename,
+        "metadata": metadata,
+    });
+    state.broadcast("mooshie:image_saved", payload.clone());
+    let _ = state.dispatch_webhook_event("image_saved", payload).await;
+    Ok(saved)
+}
+
+fn sanitize_filename_component(value: &str) -> String {
+    value
+        .trim()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>()
+        .replace("..", "_")
+        .trim_matches('_')
+        .to_string()
+}
+
+fn parse_index_from_base(base: &str) -> String {
+    let mut digits = String::new();
+    for ch in base.chars().rev() {
+        if ch.is_ascii_digit() {
+            digits.insert(0, ch);
+        } else {
+            break;
+        }
+    }
+    if digits.is_empty() {
+        "0".to_string()
+    } else {
+        digits
+    }
+}
+
+fn template_value(
+    key: &str,
+    prompt_id: &str,
+    mode: &str,
+    base: &str,
+    metadata: Option<&std::collections::HashMap<String, String>>,
+) -> String {
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    match key {
+        "prompt_id" => prompt_id.to_string(),
+        "mode" => mode.to_string(),
+        "index" => parse_index_from_base(base),
+        // Kept simple and dependency-free; Unix timestamp is stable and sortable.
+        "date" => now_secs.to_string(),
+        "time" => now_secs.to_string(),
+        "model" => metadata
+            .and_then(|m| {
+                m.get("checkpoint")
+                    .or_else(|| m.get("model"))
+                    .or_else(|| m.get("model_name"))
+            })
+            .cloned()
+            .unwrap_or_else(|| "unknown-model".to_string()),
+        "seed" => metadata
+            .and_then(|m| m.get("seed"))
+            .cloned()
+            .unwrap_or_else(|| "0".to_string()),
+        _ => String::new(),
+    }
+}
+
+fn render_output_filename_base(
+    template: Option<&str>,
+    prompt_id: &str,
+    mode: &str,
+    base: &str,
+    metadata: Option<&std::collections::HashMap<String, String>>,
+) -> String {
+    if let Some(tpl) = template.map(str::trim).filter(|s| !s.is_empty()) {
+        let mut out = tpl.to_string();
+        for key in [
+            "prompt_id",
+            "mode",
+            "index",
+            "date",
+            "time",
+            "model",
+            "seed",
+        ] {
+            let token = format!("{{{}}}", key);
+            let value =
+                sanitize_filename_component(&template_value(key, prompt_id, mode, base, metadata));
+            out = out.replace(&token, &value);
+        }
+        let cleaned = sanitize_filename_component(&out);
+        if !cleaned.is_empty() {
+            return cleaned;
+        }
+    }
+    sanitize_filename_component(&format!("{}__{}__{}", prompt_id, mode, base))
 }
 
 pub fn save_to_gallery_inner(
@@ -889,7 +1064,15 @@ pub fn save_to_gallery_inner(
         crate::metadata::ImageFormat::Jxl => "jxl",
         _ => "png",
     };
-    let gallery_filename = format!("{}__{}__{}.{}", prompt_id, normalized_mode, base, ext);
+    let cfg = crate::config::load_persisted_config();
+    let rendered_base = render_output_filename_base(
+        cfg.output_filename_template.as_deref(),
+        prompt_id,
+        normalized_mode,
+        base,
+        metadata,
+    );
+    let gallery_filename = format!("{}.{}", rendered_base, ext);
     let path = dir.join(&gallery_filename);
 
     let raw_mode = metadata_mode.unwrap_or("text_chunk");
@@ -962,7 +1145,8 @@ pub async fn read_image_metadata(
 ) -> Result<Option<std::collections::HashMap<String, String>>, AppError> {
     let dir = crate::config::gallery_dir()
         .ok_or_else(|| AppError::Other("Cannot find gallery directory".into()))?;
-    let path = dir.join(&filename);
+    let path = resolve_gallery_image_path(&dir, &filename)
+        .ok_or_else(|| AppError::Other(format!("Gallery image not found: {}", filename)))?;
     let bytes = std::fs::read(&path)?;
     crate::metadata::read_image_metadata(&bytes).map_err(AppError::Other)
 }
@@ -1061,7 +1245,8 @@ pub async fn load_gallery_image(filename: String) -> Result<Vec<u8>, AppError> {
     }
     let dir = crate::config::gallery_dir()
         .ok_or_else(|| AppError::Other("Cannot find gallery directory".into()))?;
-    let path = dir.join(&filename);
+    let path = resolve_gallery_image_path(&dir, &filename)
+        .ok_or_else(|| AppError::Other(format!("Gallery image not found: {}", filename)))?;
     let bytes = std::fs::read(&path)?;
     Ok(bytes)
 }
@@ -1077,7 +1262,8 @@ pub async fn load_gallery_image_png(filename: String) -> Result<Vec<u8>, AppErro
     }
     let dir = crate::config::gallery_dir()
         .ok_or_else(|| AppError::Other("Cannot find gallery directory".into()))?;
-    let path = dir.join(&filename);
+    let path = resolve_gallery_image_path(&dir, &filename)
+        .ok_or_else(|| AppError::Other(format!("Gallery image not found: {}", filename)))?;
     let bytes = std::fs::read(&path)?;
     if filename.ends_with(".jxl") {
         let png = tokio::task::spawn_blocking(move || -> Result<Vec<u8>, String> {
@@ -1106,7 +1292,8 @@ pub async fn load_gallery_image_display(filename: String) -> Result<Vec<u8>, App
     }
     let dir = crate::config::gallery_dir()
         .ok_or_else(|| AppError::Other("Cannot find gallery directory".into()))?;
-    let path = dir.join(&filename);
+    let path = resolve_gallery_image_path(&dir, &filename)
+        .ok_or_else(|| AppError::Other(format!("Gallery image not found: {}", filename)))?;
     let bytes = std::fs::read(&path)?;
     if filename.ends_with(".jxl") {
         let webp = tokio::task::spawn_blocking(move || transcode_jxl_to_webp(&bytes))
@@ -1131,17 +1318,43 @@ pub async fn read_temp_image(filename: String) -> Result<Vec<u8>, AppError> {
         .ok_or_else(|| AppError::Other(format!("Temp image not found: {}", filename)))
 }
 
+/// Locate a gallery file under the root gallery dir or `users/{username}/` subdirs.
+pub fn resolve_gallery_image_path(
+    base_dir: &std::path::Path,
+    filename: &str,
+) -> Option<std::path::PathBuf> {
+    if filename.contains('/') || filename.contains('\\') || filename.contains("..") {
+        return None;
+    }
+    let direct = base_dir.join(filename);
+    if direct.is_file() {
+        return Some(direct);
+    }
+    let users_dir = base_dir.join("users");
+    if !users_dir.is_dir() {
+        return None;
+    }
+    let entries = std::fs::read_dir(&users_dir).ok()?;
+    for entry in entries.flatten() {
+        if !entry.file_type().ok().is_some_and(|ft| ft.is_dir()) {
+            continue;
+        }
+        let candidate = entry.path().join(filename);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
 /// Generate a WebP thumbnail for a gallery image. Used by the `thumbnail://` protocol.
 pub fn generate_thumbnail(
     gallery_dir: &std::path::Path,
     filename: &str,
     max_size: u32,
 ) -> Result<Vec<u8>, String> {
-    // Reject path traversal attempts — filename must be a plain basename.
-    if filename.contains('/') || filename.contains('\\') || filename.contains("..") {
-        return Err("Invalid filename".to_string());
-    }
-    let path = gallery_dir.join(filename);
+    let path = resolve_gallery_image_path(gallery_dir, filename)
+        .ok_or_else(|| "Read failed: The system cannot find the file specified.".to_string())?;
     let bytes = std::fs::read(&path).map_err(|e| format!("Read failed: {}", e))?;
 
     let img = decode_gallery_image(&bytes)?;
@@ -1186,13 +1399,8 @@ pub fn transcode_jxl_to_webp(bytes: &[u8]) -> Result<Vec<u8>, String> {
 pub async fn get_gallery_image_path(filename: String) -> Result<String, AppError> {
     let dir = crate::config::gallery_dir()
         .ok_or_else(|| AppError::Other("Cannot find gallery directory".into()))?;
-    let path = dir.join(&filename);
-    if !path.exists() {
-        return Err(AppError::Other(format!(
-            "Gallery image not found: {}",
-            filename
-        )));
-    }
+    let path = resolve_gallery_image_path(&dir, &filename)
+        .ok_or_else(|| AppError::Other(format!("Gallery image not found: {}", filename)))?;
     Ok(path.to_string_lossy().into_owned())
 }
 
@@ -1201,11 +1409,10 @@ pub async fn get_gallery_image_path(filename: String) -> Result<String, AppError
 pub async fn delete_gallery_image(filename: String) -> Result<(), AppError> {
     let dir = crate::config::gallery_dir()
         .ok_or_else(|| AppError::Other("Cannot find gallery directory".into()))?;
-    let path = dir.join(&filename);
-    if path.exists() {
+    if let Some(path) = resolve_gallery_image_path(&dir, &filename) {
         std::fs::remove_file(&path)?;
+        crate::gallery_index::remove(&path);
     }
-    crate::gallery_index::remove(&path);
     Ok(())
 }
 
@@ -1218,15 +1425,25 @@ pub async fn rename_gallery_image(
     let dir = crate::config::gallery_dir()
         .ok_or_else(|| AppError::Other("Cannot find gallery directory".into()))?;
 
-    let old_path = dir.join(&old_filename);
-    if !old_path.exists() {
+    let old_path = resolve_gallery_image_path(&dir, &old_filename)
+        .ok_or_else(|| AppError::Other(format!("Gallery image not found: {}", old_filename)))?;
+
+    // Disallow path traversal / directory injection in rename target.
+    let new_name_path = std::path::Path::new(&new_filename);
+    let is_single_component = new_name_path.components().count() == 1;
+    let exact_file_name =
+        new_name_path.file_name().and_then(|n| n.to_str()) == Some(new_filename.as_str());
+    if new_filename.trim().is_empty() || !is_single_component || !exact_file_name {
         return Err(AppError::Other(format!(
-            "Gallery image not found: {}",
-            old_filename
+            "Invalid gallery filename for rename: {}",
+            new_filename
         )));
     }
 
-    let new_path = dir.join(&new_filename);
+    let new_path = old_path
+        .parent()
+        .ok_or_else(|| AppError::Other("Invalid gallery path".into()))?
+        .join(&new_filename);
     if new_path.exists() {
         return Err(AppError::Other(format!(
             "Target gallery filename already exists: {}",
@@ -2592,13 +2809,19 @@ pub(crate) fn category_subdirs(category: &str) -> &'static [&'static str] {
         "unet" => &["unet", "models/unet", "Models/unet"],
         "diffusion_models" => &[
             "diffusion_models",
+            "DiffusionModels",
             "models/diffusion_models",
+            "models/DiffusionModels",
             "Models/diffusion_models",
+            "Models/DiffusionModels",
         ],
         "text_encoders" => &[
             "text_encoders",
+            "TextEncoders",
             "models/text_encoders",
+            "models/TextEncoders",
             "Models/text_encoders",
+            "Models/TextEncoders",
         ],
         "ultralytics" => &["ultralytics", "models/ultralytics", "Models/ultralytics"],
         _ => &[],
@@ -2636,7 +2859,7 @@ pub(crate) fn resolve_model_path(
             .map(|s| s.trim())
             .filter(|s| !s.is_empty())
         {
-            let base = std::path::Path::new(dir);
+            let base = resolve_extra_model_root(std::path::Path::new(dir));
             // Try all known subdirectory variants for this category
             for subdir in subdirs {
                 let candidate = base.join(subdir).join(filename);

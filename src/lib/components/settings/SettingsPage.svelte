@@ -1,6 +1,6 @@
 <script lang="ts">
   import type { AppConfig, QueueInfo } from "../../types/index.js";
-  import { getConfig, updateConfig, stopComfyui, startComfyui, fetchReleaseNotes, importImageDirectory, exportLogs, getGalleryPath, setGalleryPath, setStorageLimit, installAttentionBackend, checkAttentionBackend, clearAllQueues, getQueue } from "../../utils/api.js";
+  import { getConfig, updateConfig, stopComfyui, startComfyui, fetchReleaseNotes, importImageDirectory, exportLogs, getGalleryPath, setGalleryPath, setStorageLimit, installAttentionBackend, checkAttentionBackend, clearAllQueues, getQueue, getGpuStats } from "../../utils/api.js";
   import type { ReleaseNote, ImportResult, AttentionBackendStatus } from "../../utils/api.js";
   import { connection } from "../../stores/connection.svelte.js";
   import { autocomplete } from "../../stores/autocomplete.svelte.js";
@@ -13,7 +13,14 @@
   import GpuStatusPanel from "./GpuStatusPanel.svelte";
   import ModelRequestsPanel from "./ModelRequestsPanel.svelte";
   import { ipcInvoke, ipcListen, isTauri, isBrowserMode, authHeaders, clearAuthToken } from "../../utils/ipc.js";
-  import { applyTheme, THEME_PALETTES } from "../../utils/theme.js";
+  import {
+    applyTheme,
+    THEME_PALETTES,
+    THEME_TONE_FIELDS,
+    DEFAULT_THEME_TONE_DARK,
+    DEFAULT_THEME_TONE_LIGHT,
+  } from "../../utils/theme.js";
+  import type { ThemeProfile, ThemeTone } from "../../utils/theme.js";
   import { onMount, onDestroy } from "svelte";
   import { marked } from "marked";
   import { clearArtistImageCache, getArtistImageCacheCount } from "../../artist-gallery/imageCache.js";
@@ -37,6 +44,12 @@
   }
   const isAdmin = $derived(userRole === "admin");
   const canManageServer = $derived(userRole === "admin" || userRole === "moderator");
+
+  const activeThemeProfile = $derived.by(() => {
+    if (!config?.theme_profile_id) return null;
+    const profiles = config.theme_profiles ?? [];
+    return profiles.find((profile) => profile.id === config!.theme_profile_id) ?? null;
+  });
 
   /** Open a directory picker. Returns path string or null. */
   async function openDirectoryDialog(title: string): Promise<string | null> {
@@ -69,6 +82,39 @@
   // Attention backend state
   let attentionInstalling = $state(false);
   let attentionError = $state<string | null>(null);
+  let attentionStatus = $state<AttentionBackendStatus | null>(null);
+  let attentionStatusLoading = $state(false);
+  let attentionStatusError = $state<string | null>(null);
+  let attentionStatusVenvPath = $state<string | null>(null);
+  let workersDetecting = $state(false);
+  let newThemeName = $state("Custom Theme");
+  let themeImportError = $state<string | null>(null);
+  let themeImportDone = $state(false);
+  let themeExportDone = $state(false);
+  let themeExportError = $state<string | null>(null);
+  let showThemeCreatorModal = $state(false);
+  let draftEditingProfileId = $state<string | null>(null);
+  let settingsLoadError = $state<string | null>(null);
+  let draftThemeName = $state("Custom Theme");
+  let draftThemeDark = $state<ThemeTone>({ ...DEFAULT_THEME_TONE_DARK });
+  let draftThemeLight = $state<ThemeTone>({ ...DEFAULT_THEME_TONE_LIGHT });
+  let draftThemeBackgroundImage = $state<string | null>(null);
+  let draftThemeBackgroundFade = $state(0.65);
+  let draftThemeHideBranding = $state(false);
+  let draftThemeLogoImage = $state<string | null>(null);
+  let draftToneLinked = $state<Record<keyof ThemeTone, boolean>>({
+    main: true,
+    sub: true,
+    trim: true,
+    background: true,
+    text: true,
+  });
+  let showLogoCropModal = $state(false);
+  let pendingLogoDataUrl = $state<string | null>(null);
+  let logoCropZoom = $state(1);
+  let logoCropPanX = $state(0);
+  let logoCropPanY = $state(0);
+  let logoCropTarget = $state<"draft" | "active">("draft");
 
   // Gallery import state
   let importBusy = $state(false);
@@ -85,6 +131,54 @@
   let clearQueueDone = $state(false);
   let clearQueueError = $state<string | null>(null);
   let showClearQueueConfirm = $state(false);
+
+  function ensureGpuWorkers() {
+    if (!config) return;
+    if (!Array.isArray(config.gpu_workers)) config.gpu_workers = [];
+  }
+
+  function addGpuWorker() {
+    if (!config) return;
+    ensureGpuWorkers();
+    config.gpu_workers = [
+      ...config.gpu_workers,
+      {
+        gpu_index: config.gpu_workers.length,
+        port: null,
+        enabled: true,
+        label: null,
+        vram_mode: null,
+      },
+    ];
+    autoSave();
+  }
+
+  function removeGpuWorker(index: number) {
+    if (!config) return;
+    ensureGpuWorkers();
+    config.gpu_workers = config.gpu_workers.filter((_, i) => i !== index);
+    autoSave();
+  }
+
+  async function autoDetectGpuWorkers() {
+    if (!config) return;
+    workersDetecting = true;
+    try {
+      const stats = await getGpuStats();
+      if (stats.length > 0) {
+        config.gpu_workers = stats.map((gpu) => ({
+          gpu_index: gpu.index,
+          port: gpu.worker?.port ?? config!.server_port + gpu.index,
+          enabled: true,
+          label: gpu.name,
+          vram_mode: null,
+        }));
+        autoSave();
+      }
+    } finally {
+      workersDetecting = false;
+    }
+  }
 
   async function handleClearQueue() {
     clearQueueBusy = true;
@@ -103,6 +197,8 @@
 
   // Mode switching state
   let switchingMode = $state(false);
+  /** After a successful switch, which mode we landed in (for status text). */
+  let modeSwitchResult = $state<"browser" | "app" | null>(null);
   let showModelManager = $state(false);
 
   // Queue viewer state (live-polling when settings page is open)
@@ -453,6 +549,7 @@
   async function switchUiMode() {
     if (!config) return;
     switchingMode = true;
+    modeSwitchResult = null;
     const newMode = !config.browser_mode;
     console.log("[switchUiMode] isTauri:", isTauri, "isBrowserMode:", isBrowserMode, "config.browser_mode:", config.browser_mode, "newMode:", newMode);
     try {
@@ -462,6 +559,7 @@
         await ipcInvoke("switch_to_browser_mode");
         console.log("[switchUiMode] switch_to_browser_mode succeeded");
         config.browser_mode = true;
+        modeSwitchResult = "browser";
       } else if (isTauri && !newMode) {
         // App mode, user wants to stay in app mode? Shouldn't happen but log it
         console.warn("[switchUiMode] already in app mode (isTauri=true, newMode=false)");
@@ -472,7 +570,7 @@
         const result = await ipcInvoke("switch_to_app_mode");
         console.log("[switchUiMode] switch_to_app_mode result:", JSON.stringify(result));
         config.browser_mode = false;
-        switchingMode = true; // keep the message visible
+        modeSwitchResult = "app";
       } else if (!isTauri && isBrowserMode && newMode) {
         // Already in browser mode wanting browser mode? Shouldn't happen
         console.warn("[switchUiMode] already in browser mode");
@@ -484,6 +582,7 @@
     } catch (e) {
       console.error("[switchUiMode] FAILED:", e);
       switchingMode = false;
+      modeSwitchResult = null;
     }
   }
 
@@ -882,7 +981,7 @@
   const sections = [
     { key: "appMode", labelKey: "settings.sections.app_mode", keywords: "browser app mode desktop native window web switch ui" },
     { key: "connection", labelKey: "settings.sections.connection", keywords: "server mode url port remote autolaunch" },
-    { key: "appearance", labelKey: "settings.sections.appearance", keywords: "theme dark light font scale size style presets fooocus" },
+    { key: "appearance", labelKey: "settings.sections.appearance", keywords: "theme dark light font scale palette custom create logo background branding import export color" },
     { key: "performance", labelKey: "settings.sections.performance", keywords: "vram mode high low normal keep alive close attention backend sage flash" },
     { key: "quality", labelKey: "settings.sections.quality", keywords: "quality tags auto masterpiece best quality anima illustrious noobai pony nanosaur positive negative prompt" },
     { key: "gpu", labelKey: "settings.sections.gpu", keywords: "gpu vram worker backend multi status utilization temperature power nvidia" },
@@ -916,6 +1015,14 @@
 
   async function loadConfig() {
     config = await getConfig();
+    if (!Array.isArray(config.theme_profiles)) config.theme_profiles = [];
+    config.theme_profile_id ??= null;
+    if (
+      config.theme_profile_id &&
+      !config.theme_profiles.some((profile) => profile.id === config!.theme_profile_id)
+    ) {
+      config.theme_profile_id = null;
+    }
     // Migrate CivitAI API key from ModelHub localStorage if not already in config
     if (!config.civitai_api_key) {
       try {
@@ -927,16 +1034,46 @@
       } catch { /* ignore */ }
     }
     snapshotRestartFields();
+    try {
+      applyTheme(config);
+    } catch (e) {
+      console.error("Failed to apply theme from config:", e);
+    }
   }
 
-  onMount(async () => {
+  async function refreshAttentionStatus() {
+    if (!config) return;
+    attentionStatusLoading = true;
+    attentionStatusError = null;
+    attentionStatusVenvPath = config.venv_path;
+    try {
+      attentionStatus = await checkAttentionBackend();
+    } catch (e: any) {
+      attentionStatusError = typeof e === "string" ? e : e.message || "Failed to check attention backend";
+    } finally {
+      attentionStatusLoading = false;
+    }
+  }
+
+  async function initSettings() {
+    loading = true;
+    settingsLoadError = null;
     try {
       await loadConfig();
     } catch (e) {
-      error = `Failed to load config: ${e}`;
+      const message = e instanceof Error ? e.message : String(e);
+      settingsLoadError = message;
+      error = `Failed to load config: ${message}`;
+      config = null;
     } finally {
       loading = false;
     }
+  }
+
+  onMount(() => {
+    void initSettings().then(() => {
+      void refreshAttentionStatus();
+    });
     loadInstallPath();
     getGalleryPath().then(p => { galleryPathDisplay = p; }).catch(() => {});
     void loadCacheCount();
@@ -985,6 +1122,7 @@
   async function autoSave() {
     if (!config) return;
     checkRestartNeeded();
+    applyTheme(config);
     try {
       await updateConfig(config);
     } catch (e) {
@@ -1007,6 +1145,7 @@
       config.attention_backend = previousBackend;
     } finally {
       attentionInstalling = false;
+      void refreshAttentionStatus();
     }
   }
 
@@ -1020,6 +1159,7 @@
       saved = true;
       snapshotRestartFields();
       checkRestartNeeded();
+      void refreshAttentionStatus();
       setTimeout(() => (saved = false), 2000);
     } catch (e) {
       error = `Failed to save: ${e}`;
@@ -1030,6 +1170,282 @@
 
   function applyFontScale(scale: number) {
     document.documentElement.style.setProperty("--font-scale", String(scale));
+  }
+
+  function normalizeHexColor(input: string): string | null {
+    const value = input.trim().replace(/^#/, "");
+    if (/^[0-9a-fA-F]{6}$/.test(value)) return `#${value.toLowerCase()}`;
+    if (/^[0-9a-fA-F]{3}$/.test(value)) {
+      const expanded = value.split("").map((char) => `${char}${char}`).join("");
+      return `#${expanded.toLowerCase()}`;
+    }
+    return null;
+  }
+
+  function updateDraftTone(mode: "dark" | "light", key: keyof ThemeTone, value: string) {
+    const normalized = normalizeHexColor(value);
+    if (!normalized) return;
+    if (mode === "dark") {
+      draftThemeDark = { ...draftThemeDark, [key]: normalized };
+      if (draftToneLinked[key]) draftThemeLight = { ...draftThemeLight, [key]: normalized };
+    } else {
+      draftThemeLight = { ...draftThemeLight, [key]: normalized };
+      if (draftToneLinked[key]) draftThemeDark = { ...draftThemeDark, [key]: normalized };
+    }
+  }
+
+  function resetThemeCreatorDraft() {
+    draftEditingProfileId = null;
+    draftThemeName = newThemeName.trim() || "Custom Theme";
+    draftThemeDark = { ...DEFAULT_THEME_TONE_DARK };
+    draftThemeLight = { ...DEFAULT_THEME_TONE_LIGHT };
+    draftThemeBackgroundImage = null;
+    draftThemeBackgroundFade = 0.65;
+    draftThemeHideBranding = false;
+    draftThemeLogoImage = null;
+    draftToneLinked = { main: true, sub: true, trim: true, background: true, text: true };
+  }
+
+  function openThemeCreatorModal() {
+    resetThemeCreatorDraft();
+    showThemeCreatorModal = true;
+  }
+
+  function openThemeEditorModal() {
+    const profile = activeThemeProfile;
+    if (!profile) return;
+    draftEditingProfileId = profile.id;
+    draftThemeName = profile.name;
+    draftThemeDark = { ...profile.dark };
+    draftThemeLight = { ...profile.light };
+    draftThemeBackgroundImage = profile.background_image;
+    draftThemeBackgroundFade = profile.background_fade;
+    draftThemeHideBranding = profile.hide_branding;
+    draftThemeLogoImage = profile.logo_image;
+    draftToneLinked = { main: false, sub: false, trim: false, background: false, text: false };
+    showThemeCreatorModal = true;
+  }
+
+  function createThemeProfileFromDraft() {
+    if (!config) return;
+    const profile: ThemeProfile = {
+      id: draftEditingProfileId ?? `theme_${Date.now()}`,
+      name: draftThemeName.trim() || "Custom Theme",
+      palette: "custom",
+      dark: { ...draftThemeDark },
+      light: { ...draftThemeLight },
+      background_image: draftThemeBackgroundImage,
+      background_fade: draftThemeBackgroundFade,
+      logo_image: draftThemeLogoImage,
+      hide_branding: draftThemeHideBranding,
+    };
+
+    if (draftEditingProfileId) {
+      config.theme_profiles = config.theme_profiles.map((existing) =>
+        existing.id === draftEditingProfileId ? profile : existing,
+      );
+      config.theme_profile_id = draftEditingProfileId;
+    } else {
+      config.theme_profiles = [...config.theme_profiles, profile];
+      config.theme_profile_id = profile.id;
+    }
+
+    newThemeName = profile.name;
+    showThemeCreatorModal = false;
+    draftEditingProfileId = null;
+    applyTheme(config);
+    void autoSave();
+  }
+
+  function openLogoCropper(dataUrl: string, target: "draft" | "active") {
+    pendingLogoDataUrl = dataUrl;
+    logoCropZoom = 1;
+    logoCropPanX = 0;
+    logoCropPanY = 0;
+    logoCropTarget = target;
+    showLogoCropModal = true;
+  }
+
+  async function cropSquareLogo(dataUrl: string, zoom: number, panX: number, panY: number): Promise<string> {
+    return new Promise((resolve, reject) => {
+      const image = new Image();
+      image.onload = () => {
+        const sourceWidth = image.naturalWidth;
+        const sourceHeight = image.naturalHeight;
+        const minSide = Math.min(sourceWidth, sourceHeight);
+        const safeZoom = Math.max(1, Math.min(3, zoom));
+        const cropSize = minSide / safeZoom;
+        const maxX = Math.max(0, (sourceWidth - cropSize) / 2);
+        const maxY = Math.max(0, (sourceHeight - cropSize) / 2);
+        const srcX = (sourceWidth - cropSize) / 2 + panX * maxX;
+        const srcY = (sourceHeight - cropSize) / 2 + panY * maxY;
+
+        const canvas = document.createElement("canvas");
+        canvas.width = 512;
+        canvas.height = 512;
+        const context = canvas.getContext("2d");
+        if (!context) {
+          reject(new Error("Failed to create crop canvas."));
+          return;
+        }
+        context.imageSmoothingEnabled = true;
+        context.imageSmoothingQuality = "high";
+        context.drawImage(image, srcX, srcY, cropSize, cropSize, 0, 0, 512, 512);
+        resolve(canvas.toDataURL("image/png"));
+      };
+      image.onerror = () => reject(new Error("Failed to decode selected image."));
+      image.src = dataUrl;
+    });
+  }
+
+  async function confirmLogoCrop() {
+    if (!pendingLogoDataUrl) return;
+    try {
+      const cropped = await cropSquareLogo(pendingLogoDataUrl, logoCropZoom, logoCropPanX, logoCropPanY);
+      if (logoCropTarget === "draft") {
+        draftThemeLogoImage = cropped;
+      } else {
+        const profile = activeThemeProfile;
+        if (!profile) return;
+        profile.logo_image = cropped;
+        void autoSave();
+      }
+      showLogoCropModal = false;
+      pendingLogoDataUrl = null;
+    } catch (err) {
+      themeImportError = String((err as Error)?.message ?? err);
+    }
+  }
+
+  function addThemeProfile() {
+    openThemeCreatorModal();
+  }
+
+  function removeActiveThemeProfile() {
+    if (!config || !config.theme_profile_id) return;
+    config.theme_profiles = config.theme_profiles.filter((profile) => profile.id !== config!.theme_profile_id);
+    config.theme_profile_id = null;
+    void autoSave();
+  }
+
+  async function fileToDataUrl(file: File): Promise<string> {
+    return await new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(String(reader.result ?? ""));
+      reader.onerror = () => reject(reader.error ?? new Error("Failed to read file"));
+      reader.readAsDataURL(file);
+    });
+  }
+
+  async function setProfileImage(kind: "background" | "logo", event: Event) {
+    const profile = activeThemeProfile;
+    const input = event.target as HTMLInputElement;
+    const file = input.files?.[0];
+    if (!profile || !file) return;
+    const dataUrl = await fileToDataUrl(file);
+    if (kind === "background") {
+      profile.background_image = dataUrl;
+      void autoSave();
+    } else {
+      openLogoCropper(dataUrl, "active");
+    }
+    input.value = "";
+  }
+
+  async function setDraftThemeImage(kind: "background" | "logo", event: Event) {
+    const input = event.target as HTMLInputElement;
+    const file = input.files?.[0];
+    if (!file) return;
+    const dataUrl = await fileToDataUrl(file);
+    if (kind === "background") {
+      draftThemeBackgroundImage = dataUrl;
+    } else {
+      openLogoCropper(dataUrl, "draft");
+    }
+    input.value = "";
+  }
+
+  async function importThemeProfiles(event: Event) {
+    if (!config) return;
+    themeImportError = null;
+    themeImportDone = false;
+    const input = event.target as HTMLInputElement;
+    const file = input.files?.[0];
+    if (!file) return;
+    try {
+      const parsed = JSON.parse(await file.text()) as { themes?: unknown[] };
+      if (!Array.isArray(parsed.themes)) throw new Error("Invalid theme file.");
+      const imported = parsed.themes.map((theme, index) => {
+        const source = (typeof theme === "object" && theme) ? (theme as Partial<ThemeProfile>) : {};
+        const dark = source.dark ?? {};
+        const light = source.light ?? {};
+        return {
+          id: typeof source.id === "string" && source.id.trim() ? source.id : `theme_${Date.now()}_${index}`,
+          name: typeof source.name === "string" && source.name.trim() ? source.name.trim() : `Imported Theme ${index + 1}`,
+          palette:
+            source.palette === "mooshie" ||
+            source.palette === "nord" ||
+            source.palette === "solarized" ||
+            source.palette === "gruvbox" ||
+            source.palette === "catppuccin" ||
+            source.palette === "custom"
+              ? source.palette
+              : "custom",
+          dark: {
+            main: typeof dark.main === "string" ? dark.main : DEFAULT_THEME_TONE_DARK.main,
+            sub: typeof dark.sub === "string" ? dark.sub : DEFAULT_THEME_TONE_DARK.sub,
+            trim: typeof dark.trim === "string" ? dark.trim : DEFAULT_THEME_TONE_DARK.trim,
+            background: typeof dark.background === "string" ? dark.background : DEFAULT_THEME_TONE_DARK.background,
+            text: typeof dark.text === "string" ? dark.text : DEFAULT_THEME_TONE_DARK.text,
+          },
+          light: {
+            main: typeof light.main === "string" ? light.main : DEFAULT_THEME_TONE_LIGHT.main,
+            sub: typeof light.sub === "string" ? light.sub : DEFAULT_THEME_TONE_LIGHT.sub,
+            trim: typeof light.trim === "string" ? light.trim : DEFAULT_THEME_TONE_LIGHT.trim,
+            background: typeof light.background === "string" ? light.background : DEFAULT_THEME_TONE_LIGHT.background,
+            text: typeof light.text === "string" ? light.text : DEFAULT_THEME_TONE_LIGHT.text,
+          },
+          background_image: typeof source.background_image === "string" ? source.background_image : null,
+          background_fade:
+            typeof source.background_fade === "number" && Number.isFinite(source.background_fade)
+              ? Math.max(0, Math.min(1, source.background_fade))
+              : 0.65,
+          logo_image: typeof source.logo_image === "string" ? source.logo_image : null,
+          hide_branding: Boolean(source.hide_branding),
+        } satisfies ThemeProfile;
+      });
+      config.theme_profiles = imported;
+      config.theme_profile_id = imported[0]?.id ?? null;
+      await autoSave();
+      themeImportDone = true;
+      setTimeout(() => (themeImportDone = false), 2500);
+    } catch (error: any) {
+      themeImportError = String(error?.message ?? error);
+    } finally {
+      input.value = "";
+    }
+  }
+
+  function exportThemeProfiles() {
+    if (!config) return;
+    themeExportDone = false;
+    themeExportError = null;
+    try {
+      const payload = JSON.stringify({ themes: config.theme_profiles }, null, 2);
+      const blob = new Blob([payload], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = "mooshie-themes.json";
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      URL.revokeObjectURL(url);
+      themeExportDone = true;
+      setTimeout(() => (themeExportDone = false), 2500);
+    } catch (error: any) {
+      themeExportError = String(error?.message ?? error);
+    }
   }
 
   async function restartServer() {
@@ -1115,8 +1531,19 @@
   >
     <div class="columns-1 {mobileFriendly ? '' : 'lg:columns-2 xl:columns-3'} gap-4">
       {#if loading}
-        <div class="flex items-center justify-center py-12 text-neutral-500">
+        <div class="flex flex-col items-center justify-center py-12 text-neutral-500 gap-3">
           <div class="w-6 h-6 border-2 border-indigo-500 border-t-transparent rounded-full animate-spin"></div>
+          <p class="text-xs text-neutral-500">{locale.t("common.loading")}</p>
+        </div>
+      {:else if settingsLoadError}
+        <div class="rounded-xl border border-red-800/50 bg-red-950/30 p-5 space-y-3 break-inside-avoid">
+          <p class="text-sm text-red-200">{locale.t("settings.load_failed")}</p>
+          <p class="text-xs text-red-300/90">{settingsLoadError}</p>
+          <button
+            type="button"
+            class="px-4 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-medium cursor-pointer"
+            onclick={() => void initSettings()}
+          >{locale.t("common.retry")}</button>
         </div>
       {:else if config}
         <!-- Browser / App Mode Switch (admin only; hidden on mobile — users are already in browser mode) -->
@@ -1145,9 +1572,13 @@
             </div>
             {#if switchingMode}
               <p class="text-xs text-amber-400">
-                {config.browser_mode
-                  ? locale.t('settings.app_mode.switched_to_app')
-                  : locale.t('settings.app_mode.switching_to_browser')}
+                {#if modeSwitchResult === "browser"}
+                  {locale.t('settings.app_mode.switched_to_browser')}
+                {:else if modeSwitchResult === "app"}
+                  {locale.t('settings.app_mode.switched_to_app')}
+                {:else}
+                  {locale.t('settings.app_mode.switching_to_browser')}
+                {/if}
               </p>
             {/if}
             {#if config.browser_mode}
@@ -1485,6 +1916,10 @@
             </select>
           </div>
 
+          {#if config.server_mode === "remote"}
+          <p class="text-xs text-neutral-500">{locale.t('settings.connection.mode_remote_desc')}</p>
+          {/if}
+
           {#if config.server_mode === "autolaunch"}
           <div class="flex items-center justify-between">
             <div>
@@ -1512,6 +1947,9 @@
                 class="w-full bg-neutral-800 border border-neutral-700 rounded-lg px-3 py-2 text-sm text-neutral-100 placeholder-neutral-500 focus:outline-none focus:border-indigo-500 transition-colors"
                 placeholder={locale.t('settings.connection.server_url_placeholder')}
               />
+              {#if config.server_mode === "remote"}
+              <p class="text-xs text-neutral-500 mt-1">{locale.t('settings.connection.remote_url_hint')}</p>
+              {/if}
             </div>
             <div>
               <label class="block text-xs text-neutral-400 mb-1">{locale.t('settings.connection.port')}<span class="text-amber-400">*</span></label>
@@ -1546,6 +1984,40 @@
               />
               <p class="text-xs text-neutral-500 mt-1">{locale.t('settings.connection.pip_index_url_desc')}</p>
             </div>
+            <div class="col-span-3">
+              <label class="block text-xs text-neutral-400 mb-1">Output filename template</label>
+              <input
+                type="text"
+                bind:value={config.output_filename_template}
+                oninput={checkRestartNeeded}
+                class="w-full bg-neutral-800 border border-neutral-700 rounded-lg px-3 py-2 text-sm text-neutral-100 placeholder-neutral-500 focus:outline-none focus:border-indigo-500 transition-colors"
+                placeholder={`{prompt_id}__{mode}__{model}__{seed}`}
+              />
+              <p class="text-xs text-neutral-500 mt-1">
+                Keys: {`{prompt_id}`}, {`{mode}`}, {`{index}`}, {`{date}`}, {`{time}`}, {`{model}`}, {`{seed}`}
+              </p>
+            </div>
+            <div class="col-span-3">
+              <label class="block text-xs text-neutral-400 mb-1">Webhook URL</label>
+              <input
+                type="text"
+                bind:value={config.webhook_url}
+                oninput={checkRestartNeeded}
+                class="w-full bg-neutral-800 border border-neutral-700 rounded-lg px-3 py-2 text-sm text-neutral-100 placeholder-neutral-500 focus:outline-none focus:border-indigo-500 transition-colors"
+                placeholder="https://example.com/webhooks/mooshie"
+              />
+              <div class="mt-2 flex flex-wrap gap-4 text-xs text-neutral-400">
+                <label class="inline-flex items-center gap-2">
+                  <input type="checkbox" bind:checked={config.webhook_include_sensitive} class="accent-indigo-500" />
+                  Include prompt/metadata
+                </label>
+                <label class="inline-flex items-center gap-2">
+                  <input type="checkbox" bind:checked={config.webhook_allow_private_targets} class="accent-indigo-500" />
+                  Allow localhost/private targets
+                </label>
+              </div>
+              <p class="text-xs text-neutral-500 mt-1">Enabled event: <code>image_saved</code> (async retry with backoff).</p>
+            </div>
           </div>
           </div>
           {/if}
@@ -1565,6 +2037,8 @@
 
           {#if !collapsed.appearance}
           <div class="px-5 pb-5 space-y-4">
+          <p class="text-xs font-medium text-neutral-300">{locale.t("settings.appearance.builtin_theme")}</p>
+          <p class="text-[10px] text-neutral-500 -mt-2">{locale.t("settings.appearance.builtin_palette_hint")}</p>
           <div class="grid grid-cols-2 gap-3">
             <div>
               <label for="theme-mode" class="block text-xs text-neutral-400 mb-1">{locale.t('settings.appearance.theme')}</label>
@@ -1572,7 +2046,7 @@
                 id="theme-mode"
                 name="theme-mode"
                 bind:value={config.theme}
-                onchange={() => { if (config) { applyTheme(config.theme, config.theme_palette); autoSave(); } }}
+                onchange={() => { if (config) { applyTheme(config); autoSave(); } }}
                 class="w-full bg-neutral-800 border border-neutral-700 rounded-lg px-3 py-2 text-sm text-neutral-100 focus:outline-none focus:border-indigo-500 transition-colors"
               >
                 <option value="dark">{locale.t('settings.appearance.theme_dark')}</option>
@@ -1586,7 +2060,7 @@
                 id="theme-palette"
                 name="theme-palette"
                 bind:value={config.theme_palette}
-                onchange={() => { if (config) { applyTheme(config.theme, config.theme_palette); autoSave(); } }}
+                onchange={() => { if (config) { config.theme_profile_id = null; applyTheme(config); autoSave(); } }}
                 class="w-full bg-neutral-800 border border-neutral-700 rounded-lg px-3 py-2 text-sm text-neutral-100 focus:outline-none focus:border-indigo-500 transition-colors"
               >
                 {#each THEME_PALETTES as palette}
@@ -1611,6 +2085,122 @@
                 class="w-full accent-indigo-500"
               />
             </div>
+          </div>
+
+          {#if config.theme_profile_id}
+            <p class="text-[10px] text-amber-400/90">{locale.t("settings.appearance.custom_theme_active_hint")}</p>
+          {/if}
+
+          <div class="rounded-lg border border-indigo-500/30 bg-neutral-950/80 p-4 space-y-3">
+            <div>
+              <h3 class="text-sm font-medium text-neutral-100">{locale.t("settings.appearance.custom_themes_title")}</h3>
+              <p class="text-[10px] text-neutral-500 mt-1">{locale.t("settings.appearance.custom_themes_desc")}</p>
+            </div>
+
+            {#if (config.theme_profiles ?? []).length === 0}
+              <p class="text-xs text-neutral-400">{locale.t("settings.appearance.no_custom_themes")}</p>
+            {/if}
+
+            <div class="flex flex-col sm:flex-row items-stretch sm:items-end gap-2">
+              <div class="flex-1 min-w-0">
+                <label for="custom-theme-name" class="block text-xs text-neutral-400 mb-1">{locale.t("settings.appearance.custom_theme_name")}</label>
+                <input
+                  id="custom-theme-name"
+                  type="text"
+                  bind:value={newThemeName}
+                  class="w-full bg-neutral-800 border border-neutral-700 rounded-lg px-3 py-2 text-sm text-neutral-100"
+                  placeholder={locale.t("settings.appearance.custom_theme_name_placeholder")}
+                  onkeydown={(e) => { if (e.key === "Enter") openThemeCreatorModal(); }}
+                />
+              </div>
+              <button
+                type="button"
+                class="shrink-0 px-4 py-2 text-sm font-medium rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white transition-colors cursor-pointer"
+                onclick={openThemeCreatorModal}
+              >{locale.t("settings.appearance.create_theme")}</button>
+            </div>
+
+            <div>
+              <label for="saved-theme-select" class="block text-xs text-neutral-400 mb-1">{locale.t("settings.appearance.saved_themes")}</label>
+              <select
+                id="saved-theme-select"
+                value={config.theme_profile_id ?? "__builtin__"}
+                onchange={(event) => {
+                  if (!config) return;
+                  const value = (event.target as HTMLSelectElement).value;
+                  config.theme_profile_id = value === "__builtin__" ? null : value;
+                  applyTheme(config);
+                  autoSave();
+                }}
+                class="w-full bg-neutral-800 border border-neutral-700 rounded-lg px-3 py-2 text-sm text-neutral-100"
+              >
+                <option value="__builtin__">{locale.t("settings.appearance.use_builtin_palette")}</option>
+                {#each config.theme_profiles ?? [] as profile}
+                  <option value={profile.id}>{profile.name}</option>
+                {/each}
+              </select>
+            </div>
+
+            {#if activeThemeProfile}
+              <div class="rounded-lg border border-neutral-800 bg-neutral-900/70 p-2 space-y-2">
+                <div class="text-xs text-neutral-300 font-medium">{locale.t("settings.appearance.theme_preview")}</div>
+                <div class="grid grid-cols-2 gap-2">
+                  <div class="rounded-md border border-neutral-700 p-2 space-y-1" style="background:{activeThemeProfile.dark.background}; color:{activeThemeProfile.dark.text}">
+                    <div class="text-[10px] font-semibold">{locale.t("settings.appearance.dark_preview")}</div>
+                    <div class="h-2 rounded" style="background:{activeThemeProfile.dark.main}"></div>
+                    <div class="h-2 rounded" style="background:{activeThemeProfile.dark.sub}"></div>
+                    <div class="h-2 rounded" style="background:{activeThemeProfile.dark.trim}"></div>
+                  </div>
+                  <div class="rounded-md border border-neutral-700 p-2 space-y-1" style="background:{activeThemeProfile.light.background}; color:{activeThemeProfile.light.text}">
+                    <div class="text-[10px] font-semibold">{locale.t("settings.appearance.light_preview")}</div>
+                    <div class="h-2 rounded" style="background:{activeThemeProfile.light.main}"></div>
+                    <div class="h-2 rounded" style="background:{activeThemeProfile.light.sub}"></div>
+                    <div class="h-2 rounded" style="background:{activeThemeProfile.light.trim}"></div>
+                  </div>
+                </div>
+                <div class="flex items-center gap-2 text-[10px] text-neutral-400">
+                  <span>{locale.t("settings.appearance.logo_preview")}</span>
+                  {#if activeThemeProfile.logo_image}
+                    <img src={activeThemeProfile.logo_image} alt="theme logo preview" class="w-6 h-6 rounded object-cover border border-neutral-700" />
+                  {:else}
+                    <span class="text-neutral-500">-</span>
+                  {/if}
+                  <span class="ml-2">{locale.t("settings.appearance.background_preview")}</span>
+                  {#if activeThemeProfile.background_image}
+                    <span class="text-green-400">{locale.t("settings.appearance.status_on")}</span>
+                  {:else}
+                    <span class="text-neutral-500">{locale.t("settings.appearance.status_off")}</span>
+                  {/if}
+                </div>
+              </div>
+
+              <div class="flex flex-wrap gap-2">
+                <button
+                  type="button"
+                  class="px-3 py-1.5 text-xs rounded bg-indigo-600 hover:bg-indigo-500 text-white transition-colors cursor-pointer"
+                  onclick={openThemeEditorModal}
+                >{locale.t("settings.appearance.edit_theme")}</button>
+                <button
+                  type="button"
+                  class="px-3 py-1.5 text-xs rounded bg-red-700/70 hover:bg-red-700 text-white transition-colors cursor-pointer"
+                  onclick={removeActiveThemeProfile}
+                >{locale.t("settings.appearance.delete_theme_profile")}</button>
+              </div>
+            {/if}
+
+            <div class="flex gap-2">
+              <button class="px-3 py-1.5 text-xs rounded bg-neutral-800 hover:bg-neutral-700 text-neutral-100 transition-colors cursor-pointer" onclick={exportThemeProfiles}>
+                {locale.t("settings.appearance.export_themes")}
+              </button>
+              <label class="px-3 py-1.5 text-xs rounded bg-neutral-800 hover:bg-neutral-700 text-neutral-100 transition-colors cursor-pointer">
+                {locale.t("settings.appearance.import_themes")}
+                <input type="file" accept=".json,application/json" class="hidden" onchange={importThemeProfiles} />
+              </label>
+            </div>
+            {#if themeImportError}<p class="text-xs text-red-400">{themeImportError}</p>{/if}
+            {#if themeImportDone}<p class="text-xs text-green-400">{locale.t("settings.appearance.themes_imported")}</p>{/if}
+            {#if themeExportError}<p class="text-xs text-red-400">{themeExportError}</p>{/if}
+            {#if themeExportDone}<p class="text-xs text-green-400">{locale.t("settings.appearance.themes_exported")}</p>{/if}
           </div>
 
           <div>
@@ -1741,6 +2331,53 @@
             {:else}
               <p class="text-[10px] text-neutral-500 mt-0.5">{locale.t('settings.performance.attention_note')}</p>
             {/if}
+
+            <div class="rounded-lg border border-neutral-800 bg-neutral-950/50 p-3 space-y-2 mt-2">
+              <p class="text-[10px] text-neutral-500">{locale.t('settings.performance.attention_status_desc')}</p>
+
+              <div class="space-y-1.5 text-[11px]">
+                <div class="flex items-start gap-2">
+                  <span class="w-32 shrink-0 text-neutral-500">{locale.t('settings.paths.venv')}</span>
+                  <span class="min-w-0 break-all font-mono text-neutral-300">
+                    {attentionStatusVenvPath || locale.t('common.none')}
+                  </span>
+                </div>
+
+                <div class="flex items-start gap-2">
+                  <span class="w-32 shrink-0 text-neutral-500">{locale.t('settings.performance.attention_installed_packages')}</span>
+                  <span class="min-w-0 break-all text-neutral-200">
+                    {#if attentionStatusLoading && !attentionStatus}
+                      {locale.t('common.loading')}
+                    {:else if attentionStatus?.venv_packages.length}
+                      {attentionStatus.venv_packages.join(", ")}
+                    {:else}
+                      {locale.t('common.none')}
+                    {/if}
+                  </span>
+                </div>
+
+                <div class="flex items-start gap-2">
+                  <span class="w-32 shrink-0 text-neutral-500">{locale.t('settings.performance.attention_compute_capability')}</span>
+                  <span class="text-neutral-200">
+                    {#if attentionStatusLoading && !attentionStatus}
+                      {locale.t('common.loading')}
+                    {:else if attentionStatus?.compute_capability != null}
+                      {attentionStatus.compute_capability.toFixed(1)}
+                    {:else}
+                      {locale.t('settings.performance.attention_not_detected')}
+                    {/if}
+                  </span>
+                </div>
+              </div>
+
+              {#if attentionStatusError}
+                <p class="text-[10px] text-red-400">{attentionStatusError}</p>
+              {/if}
+
+              <p class="text-[10px] text-neutral-500">{locale.t('settings.performance.attention_install_target')}</p>
+              <p class="text-[10px] text-amber-400/80">{locale.t('settings.performance.attention_external_env')}</p>
+              <p class="text-[10px] text-amber-400/80">{locale.t('setup.attention.compile_warning')}</p>
+            </div>
           </div>
 
           <div class="flex items-start gap-3">
@@ -1936,7 +2573,70 @@
           </button>
 
           {#if !collapsed.gpu}
-          <div class="px-5 pb-5">
+          <div class="px-5 pb-5 space-y-4">
+            {#if config}
+              <div class="rounded-lg border border-neutral-800 bg-neutral-950/50 p-3 space-y-3">
+                <div class="flex items-center justify-between">
+                  <p class="text-xs text-neutral-300">GPU worker config</p>
+                  <div class="flex items-center gap-2">
+                    <button
+                      type="button"
+                      class="rounded border border-neutral-700 bg-neutral-800 px-2 py-1 text-xs text-neutral-200 hover:border-indigo-500"
+                      onclick={addGpuWorker}
+                    >
+                      Add
+                    </button>
+                    <button
+                      type="button"
+                      class="rounded border border-neutral-700 bg-neutral-800 px-2 py-1 text-xs text-neutral-200 hover:border-indigo-500 disabled:opacity-50"
+                      onclick={autoDetectGpuWorkers}
+                      disabled={workersDetecting}
+                    >
+                      {workersDetecting ? "Detecting..." : "Auto-detect"}
+                    </button>
+                  </div>
+                </div>
+                {#if !config.gpu_workers || config.gpu_workers.length === 0}
+                  <p class="text-[11px] text-neutral-500">No workers configured. Single-worker mode is used by default.</p>
+                {:else}
+                  <div class="space-y-2">
+                    {#each config.gpu_workers as worker, idx}
+                      <div class="grid grid-cols-12 gap-2 items-center rounded border border-neutral-800 bg-neutral-900/60 p-2">
+                        <label class="col-span-2 text-[10px] text-neutral-400">
+                          GPU
+                          <input type="number" bind:value={worker.gpu_index} oninput={() => autoSave()} class="mt-1 w-full rounded border border-neutral-700 bg-neutral-800 px-2 py-1 text-xs text-neutral-100" />
+                        </label>
+                        <label class="col-span-2 text-[10px] text-neutral-400">
+                          Port
+                          <input type="number" bind:value={worker.port} oninput={() => autoSave()} class="mt-1 w-full rounded border border-neutral-700 bg-neutral-800 px-2 py-1 text-xs text-neutral-100" />
+                        </label>
+                        <label class="col-span-4 text-[10px] text-neutral-400">
+                          Label
+                          <input type="text" bind:value={worker.label} oninput={() => autoSave()} class="mt-1 w-full rounded border border-neutral-700 bg-neutral-800 px-2 py-1 text-xs text-neutral-100" />
+                        </label>
+                        <label class="col-span-2 text-[10px] text-neutral-400">
+                          VRAM
+                          <select bind:value={worker.vram_mode} onchange={() => autoSave()} class="mt-1 w-full rounded border border-neutral-700 bg-neutral-800 px-2 py-1 text-xs text-neutral-100">
+                            <option value="">default</option>
+                            <option value="high">high</option>
+                            <option value="normal">normal</option>
+                            <option value="low">low</option>
+                            <option value="none">none</option>
+                          </select>
+                        </label>
+                        <div class="col-span-2 flex items-center justify-end gap-2">
+                          <label class="inline-flex items-center gap-1 text-[10px] text-neutral-300">
+                            <input type="checkbox" bind:checked={worker.enabled} onchange={() => autoSave()} class="accent-indigo-500" />
+                            On
+                          </label>
+                          <button type="button" class="text-xs text-red-300 hover:text-red-200" onclick={() => removeGpuWorker(idx)}>Delete</button>
+                        </div>
+                      </div>
+                    {/each}
+                  </div>
+                {/if}
+              </div>
+            {/if}
             <GpuStatusPanel />
           </div>
           {/if}
@@ -2415,8 +3115,27 @@
                 onclick={() => { autocomplete.enabled = !autocomplete.enabled; autocomplete.saveSettings(); }}
                 role="switch"
                 aria-checked={autocomplete.enabled}
+                aria-label={locale.t('settings.autocomplete.enabled')}
+                title={locale.t('settings.autocomplete.enabled')}
               >
                 <span class="absolute top-0.5 left-0.5 w-4 h-4 rounded-full bg-white transition-transform {autocomplete.enabled ? 'translate-x-5' : ''}"></span>
+              </button>
+            </label>
+
+            <label class="flex items-center justify-between gap-3 cursor-pointer">
+              <div>
+                <p class="text-sm text-neutral-200">{locale.t('settings.autocomplete.clickable_overlay')}</p>
+                <p class="text-[11px] text-neutral-500 mt-0.5">{locale.t('settings.autocomplete.clickable_overlay_desc')}</p>
+              </div>
+              <button
+                class="relative w-10 h-5 rounded-full transition-colors shrink-0 {autocomplete.clickableOverlayEnabled ? 'bg-indigo-600' : 'bg-neutral-700'}"
+                onclick={() => { autocomplete.clickableOverlayEnabled = !autocomplete.clickableOverlayEnabled; autocomplete.saveSettings(); }}
+                role="switch"
+                aria-checked={autocomplete.clickableOverlayEnabled}
+                aria-label={locale.t('settings.autocomplete.clickable_overlay')}
+                title={locale.t('settings.autocomplete.clickable_overlay')}
+              >
+                <span class="absolute top-0.5 left-0.5 w-4 h-4 rounded-full bg-white transition-transform {autocomplete.clickableOverlayEnabled ? 'translate-x-5' : ''}"></span>
               </button>
             </label>
 
@@ -2932,6 +3651,195 @@
   </div>
 </div>
 
+{#if showThemeCreatorModal}
+<div
+  class="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4"
+  onclick={(e) => { if (e.target === e.currentTarget) showThemeCreatorModal = false; }}
+  onkeydown={(e) => { if (e.key === "Escape") showThemeCreatorModal = false; }}
+  role="dialog"
+  aria-modal="true"
+  aria-labelledby="theme-creator-title"
+  tabindex="-1"
+>
+  <div class="bg-neutral-900 border border-neutral-700 rounded-xl shadow-2xl w-full max-w-3xl max-h-[90vh] overflow-auto p-5 space-y-4">
+    <div class="flex items-start justify-between gap-3">
+      <div>
+        <h3 id="theme-creator-title" class="text-sm font-semibold text-neutral-100">
+          {draftEditingProfileId
+            ? locale.t("settings.appearance.theme_modal_edit_title")
+            : locale.t("settings.appearance.theme_modal_title")}
+        </h3>
+        <p class="text-xs text-neutral-400 mt-1">{locale.t("settings.appearance.theme_modal_desc")}</p>
+      </div>
+      <button
+        type="button"
+        class="px-2 py-1 rounded bg-neutral-800 hover:bg-neutral-700 text-neutral-300 text-xs cursor-pointer"
+        onclick={() => { showThemeCreatorModal = false; }}
+      >{locale.t("common.close")}</button>
+    </div>
+
+    <div>
+      <label class="block text-xs text-neutral-400 mb-1">{locale.t("settings.appearance.custom_theme_name")}</label>
+      <input
+        type="text"
+        bind:value={draftThemeName}
+        class="w-full bg-neutral-800 border border-neutral-700 rounded-lg px-3 py-2 text-sm text-neutral-100"
+        placeholder={locale.t("settings.appearance.custom_theme_name_placeholder")}
+      />
+    </div>
+
+    <div class="rounded-lg border border-neutral-800 bg-neutral-950/60 p-3 space-y-2">
+      <p class="text-xs text-neutral-300 font-medium">{locale.t("settings.appearance.theme_colors")}</p>
+      <div class="grid grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto] gap-2 text-[11px] text-neutral-500">
+        <div>{locale.t("settings.appearance.dark_preview")}</div>
+        <div>{locale.t("settings.appearance.light_preview")}</div>
+        <div>{locale.t("settings.appearance.link_tones")}</div>
+      </div>
+      {#each THEME_TONE_FIELDS as field}
+        <div class="grid grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto] gap-2 items-start">
+          <div class="rounded border border-neutral-800 bg-neutral-900 p-2 space-y-1">
+            <label class="block text-[11px] text-neutral-400">{locale.t(field.labelKey)}</label>
+            <div class="flex gap-2">
+              <input
+                type="color"
+                value={draftThemeDark[field.key]}
+                oninput={(event) => updateDraftTone("dark", field.key, (event.target as HTMLInputElement).value)}
+                class="h-9 w-12 rounded border border-neutral-700 bg-neutral-800"
+              />
+              <input
+                type="text"
+                value={draftThemeDark[field.key]}
+                onblur={(event) => updateDraftTone("dark", field.key, (event.target as HTMLInputElement).value)}
+                class="flex-1 bg-neutral-800 border border-neutral-700 rounded px-2 py-1 text-xs text-neutral-100"
+                placeholder="#000000"
+              />
+            </div>
+          </div>
+          <div class="rounded border border-neutral-800 bg-neutral-900 p-2 space-y-1">
+            <label class="block text-[11px] text-neutral-400">{locale.t(field.labelKey)}</label>
+            <div class="flex gap-2">
+              <input
+                type="color"
+                value={draftThemeLight[field.key]}
+                oninput={(event) => updateDraftTone("light", field.key, (event.target as HTMLInputElement).value)}
+                class="h-9 w-12 rounded border border-neutral-700 bg-neutral-800"
+              />
+              <input
+                type="text"
+                value={draftThemeLight[field.key]}
+                onblur={(event) => updateDraftTone("light", field.key, (event.target as HTMLInputElement).value)}
+                class="flex-1 bg-neutral-800 border border-neutral-700 rounded px-2 py-1 text-xs text-neutral-100"
+                placeholder="#ffffff"
+              />
+            </div>
+          </div>
+          <label class="inline-flex items-center gap-1 text-[11px] text-neutral-400 pt-7">
+            <input type="checkbox" bind:checked={draftToneLinked[field.key]} class="accent-indigo-500" />
+            <span>{locale.t("settings.appearance.link")}</span>
+          </label>
+        </div>
+      {/each}
+    </div>
+
+    <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+      <div class="rounded-lg border border-neutral-800 bg-neutral-950/60 p-3 space-y-2">
+        <label class="block text-xs text-neutral-400">{locale.t("settings.appearance.background_image")}</label>
+        <input type="file" accept="image/*" onchange={(event) => setDraftThemeImage("background", event)} class="block w-full text-xs text-neutral-300" />
+        <label class="flex items-center justify-between text-xs text-neutral-400">
+          {locale.t("settings.appearance.background_fade")}
+          <span>{Math.round(draftThemeBackgroundFade * 100)}%</span>
+        </label>
+        <input type="range" min="0.35" max="0.95" step="0.05" bind:value={draftThemeBackgroundFade} class="w-full accent-indigo-500" />
+      </div>
+      <div class="rounded-lg border border-neutral-800 bg-neutral-950/60 p-3 space-y-2">
+        <label class="block text-xs text-neutral-400">{locale.t("settings.appearance.logo_image")}</label>
+        <input type="file" accept="image/*" onchange={(event) => setDraftThemeImage("logo", event)} class="block w-full text-xs text-neutral-300" />
+        <div class="h-14 w-14 rounded-lg border border-neutral-700 bg-neutral-900 flex items-center justify-center overflow-hidden">
+          {#if draftThemeLogoImage}
+            <img src={draftThemeLogoImage} alt="draft logo preview" class="h-full w-full object-contain" />
+          {:else}
+            <span class="text-[10px] text-neutral-500">{locale.t("settings.appearance.status_off")}</span>
+          {/if}
+        </div>
+        <p class="text-[10px] text-neutral-500">{locale.t("settings.appearance.logo_crop_hint")}</p>
+      </div>
+    </div>
+
+    <label class="inline-flex items-center gap-2 text-xs text-neutral-300">
+      <input type="checkbox" bind:checked={draftThemeHideBranding} class="accent-indigo-500" />
+      {locale.t("settings.appearance.hide_branding")}
+    </label>
+
+    <div class="flex justify-end gap-2 pt-1">
+      <button
+        type="button"
+        class="px-4 py-2 rounded-lg bg-neutral-800 hover:bg-neutral-700 text-neutral-300 text-xs cursor-pointer"
+        onclick={() => { showThemeCreatorModal = false; }}
+      >{locale.t("common.cancel")}</button>
+      <button
+        type="button"
+        class="px-4 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-medium cursor-pointer"
+        onclick={createThemeProfileFromDraft}
+      >{draftEditingProfileId ? locale.t("common.save") : locale.t("settings.appearance.create_theme")}</button>
+    </div>
+  </div>
+</div>
+{/if}
+
+{#if showLogoCropModal && pendingLogoDataUrl}
+<div
+  class="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm p-4"
+  onclick={(e) => { if (e.target === e.currentTarget) showLogoCropModal = false; }}
+  onkeydown={(e) => { if (e.key === "Escape") showLogoCropModal = false; }}
+  role="dialog"
+  aria-modal="true"
+  aria-labelledby="logo-crop-title"
+  tabindex="-1"
+>
+  <div class="bg-neutral-900 border border-neutral-700 rounded-xl shadow-2xl w-full max-w-md p-5 space-y-3">
+    <h3 id="logo-crop-title" class="text-sm font-semibold text-neutral-100">{locale.t("settings.appearance.logo_crop_title")}</h3>
+    <p class="text-xs text-neutral-400">{locale.t("settings.appearance.logo_crop_desc")}</p>
+
+    <div class="w-56 h-56 mx-auto rounded-xl border border-neutral-700 overflow-hidden bg-neutral-950 relative">
+      <img
+        src={pendingLogoDataUrl}
+        alt="crop source"
+        class="absolute inset-0 w-full h-full object-cover"
+        style="transform: translate({logoCropPanX * 20}%, {logoCropPanY * 20}%) scale({logoCropZoom}); transform-origin: center;"
+      />
+    </div>
+
+    <div class="space-y-2">
+      <label class="block text-xs text-neutral-400">
+        {locale.t("settings.appearance.crop_zoom")}
+        <input type="range" min="1" max="3" step="0.05" bind:value={logoCropZoom} class="w-full mt-1 accent-indigo-500" />
+      </label>
+      <label class="block text-xs text-neutral-400">
+        {locale.t("settings.appearance.crop_horizontal")}
+        <input type="range" min="-1" max="1" step="0.01" bind:value={logoCropPanX} class="w-full mt-1 accent-indigo-500" />
+      </label>
+      <label class="block text-xs text-neutral-400">
+        {locale.t("settings.appearance.crop_vertical")}
+        <input type="range" min="-1" max="1" step="0.01" bind:value={logoCropPanY} class="w-full mt-1 accent-indigo-500" />
+      </label>
+    </div>
+
+    <div class="flex justify-end gap-2">
+      <button
+        type="button"
+        class="px-4 py-2 rounded-lg bg-neutral-800 hover:bg-neutral-700 text-neutral-300 text-xs cursor-pointer"
+        onclick={() => { showLogoCropModal = false; pendingLogoDataUrl = null; }}
+      >{locale.t("common.cancel")}</button>
+      <button
+        type="button"
+        class="px-4 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-medium cursor-pointer"
+        onclick={confirmLogoCrop}
+      >{locale.t("settings.appearance.apply_crop")}</button>
+    </div>
+  </div>
+</div>
+{/if}
+
 <!-- About MooshieUI Modal -->
 {#if showAboutModal}
 <div
@@ -3270,7 +4178,8 @@
     <h3 class="text-sm font-medium text-neutral-200">{locale.t('settings.lan.storage_limit_title', { user: storageTargetUser })}</h3>
     <p class="text-xs text-neutral-400">{locale.t('settings.lan.storage_limit_desc')}</p>
     <input
-      type="number"
+      type="text"
+      inputmode="decimal"
       min="0.1"
       max="100"
       step="0.1"

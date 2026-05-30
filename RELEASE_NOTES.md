@@ -1,3 +1,63 @@
+## What's New in v1.4.2
+
+### Remote / cloud ComfyUI onboarding
+- **Setup wizard remote path**: clearer copy that desktop mode skips local ComfyUI/Python/PyTorch install and connects to a public ComfyUI URL.
+- **Settings connection hints**: remote mode now shows guidance for RunPod-style proxy URLs and the MooshieUI server Docker build requirement.
+- **README cloud section**: new **Remote / cloud ComfyUI** guide for RunPod, Vast.ai, and similar deployments.
+
+### Extra model path resolution
+- **ComfyUI root normalization**: extra model paths pointing at a ComfyUI install root (with nested `models/checkpoints` etc.) now resolve to the `models` folder for structured category scanning, install dirs, and model lookup.
+- **Stability Matrix compatibility**: flat and structured extra paths from Stability Matrix-style layouts are classified correctly at ComfyUI startup.
+
+### Model picker reliability
+- **Disk + API merge**: model lists now merge ComfyUI `/models` API results with on-disk files from configured paths so checkpoints, LoRAs, and other categories show files ComfyUI has not indexed yet.
+
+### Developer tooling
+- **`npm run tauri` wrapper**: detects npm/pnpm/yarn from `npm_config_user_agent` instead of hardcoding pnpm for dev/build invocations.
+
+---
+
+## What's New in v1.4.1
+
+### Theme customization and branding
+- **Custom theme creator modal**: adds a dedicated create/edit flow with full dark/light color controls, hex entry, linked tone syncing, and image/logo inputs.
+- **Logo crop workflow**: uploaded theme logos now go through a 1:1 crop step before save so sidebar/app branding renders consistently.
+- **Live theme/logo application**: custom logo and palette updates now propagate reliably across app surfaces, including navigation branding and custom palette token remaps.
+
+### Theme token behavior fixes
+- **Background vs panel separation**: `Background` now controls the canvas/backdrop behind panes while `Sub` controls panel/surface tinting.
+- **Main accent visibility**: `Main` again drives primary accent ramps so button and highlight colors visibly reflect the chosen primary color.
+- **Surface neutrality correction**: panel/border shades now derive from secondary tone instead of text tone to avoid unintended panel color shifts.
+
+### Stability and security hardening
+- **Settings remount stability**: removed the frontend `getConfig` timeout guard that caused false “settings timed out” failures after navigation/theme edits.
+- **Config cloning resilience**: config cache/update paths now use safe cloning fallback to prevent `structuredClone` runtime crashes on non-cloneable reactive objects.
+- **Gallery rename path safety**: backend rename command now rejects invalid target filenames that contain path traversal or directory components.
+
+---
+
+## What's New in v1.4.0
+
+### Generation workflows and creative controls
+- **Regional prompting foundations**: introduces new regional prompt tooling and supporting workflow/state plumbing for region-aware prompt composition.
+- **Style transfer path**: adds style transfer template and UI wiring for image style-transfer generation flows.
+- **Generation UX expansion**: broad generation settings/page updates, including improved model/LoRA surfaces and prompt scheduling support.
+
+### Prompt editing and autocomplete
+- **Autocomplete interaction/performance fixes**: improves prompt autocomplete responsiveness and interaction reliability.
+- **Clickable prompt overlay**: prompt boxes now support clickable tag/weight highlight segments for fast text-range selection, with a dedicated settings toggle.
+- **Exact-match suggestion ordering**: exact tag matches are promoted to the top of autocomplete results instead of being filtered out.
+
+### Setup, remote mode, and platform plumbing
+- **Setup and remote onboarding improvements**: setup wizard flow/messages and remote startup path were refined for cleaner first-run setup.
+- **Backend/webserver/tooling updates**: substantial Rust-side command/config/webserver/template changes to support new generation and browser/server behaviors.
+
+### Internationalization and maintenance
+- **Locale coverage updates**: new settings and feature text landed across all supported locale files.
+- **Docs/repo cleanup**: release/PR draft artifacts removed, durable docs reorganized under `docs/`, and guidance documents cleaned up.
+
+---
+
 ## What's New in v1.3.10
 
 ### Characters and LoRA metadata stability

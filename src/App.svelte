@@ -15,6 +15,7 @@
   import { models } from "./lib/stores/models.svelte.js";
   import { getOutputImage, uploadImageBytes, getConfig, readImageMetadata, getQueue, recoverPromptOutputs, readTempImage } from "./lib/utils/api.js";
   import { loadOutputImageForGenerationInput, uploadOutputImageForGenerationInput } from "./lib/utils/galleryActions.js";
+  import { shouldSuppressRegionalChainGallerySave, clearRegionalChainGallerySuppress } from "./lib/utils/regionalChainGallery.js";
   import { generation } from "./lib/stores/generation.svelte.js";
   import { autocomplete } from "./lib/stores/autocomplete.svelte.js";
   import { canvas } from "./lib/stores/canvas.svelte.js";
@@ -33,6 +34,7 @@
   import { notifications } from "./lib/stores/notifications.svelte.js";
   import NotificationBell from "./lib/components/ui/NotificationBell.svelte";
   import logoUrl from "./lib/assets/logo.png";
+  import { applyTheme, getActiveThemeLogoUrl, onThemeApplied } from "./lib/utils/theme.js";
 
   import { lazyThumbnail } from "./lib/utils/lazyThumbnail.js";
   import ContextMenu from "./lib/components/ui/ContextMenu.svelte";
@@ -250,13 +252,26 @@
     return tKey ? locale.t(tKey) : key;
   }
 
-  function applyTheme(theme: string) {
-    document.documentElement.classList.toggle("light", theme === "light");
-  }
-
   function applyFontScale(scale: number) {
     document.documentElement.style.setProperty("--font-scale", String(scale));
   }
+
+  function brandingHidden(): boolean {
+    return document.documentElement.dataset.branding === "off";
+  }
+
+  function resolveThemeLogoUrl(): string {
+    return getActiveThemeLogoUrl() ?? logoUrl;
+  }
+
+  let themeLogoUrl = $state(logoUrl);
+
+  $effect(() => {
+    themeLogoUrl = resolveThemeLogoUrl();
+    return onThemeApplied(() => {
+      themeLogoUrl = resolveThemeLogoUrl();
+    });
+  });
 
   async function normalizeImageBytes(
     imageBytes: number[],
@@ -590,6 +605,29 @@
     }
   }
   let versionTapCount = $state(0);
+  function handleVersionTap() {
+    if (currentPage !== "settings") return;
+    versionTapCount++;
+    if (versionTapCount >= 10) {
+      versionTapCount = 0;
+      if (generation.devModeUnlocked) {
+        generation.devModeUnlocked = false;
+        generation.devMode = false;
+        gallery.showToast(locale.t("app.dev_mode_disabled"), "info");
+      } else {
+        generation.devModeUnlocked = true;
+        gallery.showToast(locale.t("app.dev_mode_unlocked"), "success");
+      }
+    }
+  }
+
+  function handleLightboxAreaKeydown(e: KeyboardEvent) {
+    if ((e.key === "Enter" || e.key === " ") && e.target === e.currentTarget) {
+      e.preventDefault();
+      gallery.closeLightbox();
+    }
+  }
+
   let startupStatus = $state<string>("");
   let startupStatusKind = $state<"idle" | "manual" | "starting" | "connecting" | "error">("idle");
   let externalComfyOpen = $state(false);
@@ -765,7 +803,7 @@
     interrogateError = null;
     interrogateImageUrl = image.thumbnailUrl || image.url || null;
 
-    const unlistenDownload = await listen<{ downloaded: number; total: number; filename: string; done: boolean }>(
+    const unlistenDownload = await ipcListen<{ downloaded: number; total: number; filename: string; done: boolean }>(
       "interrogator:download_progress",
       (event) => {
         if (event.payload.done) {
@@ -776,7 +814,7 @@
       }
     );
 
-    const unlistenStage = await listen<string>("interrogator:stage", (event) => {
+    const unlistenStage = await ipcListen<string>("interrogator:stage", (event) => {
       interrogateStage = event.payload;
     });
 
@@ -1355,10 +1393,12 @@
         img.src = src;
       });
 
-      const [imgElements, logoImg] = await Promise.all([
-        Promise.all(cellImages.map(({ url }) => loadImg(url))),
-        loadImg(logoUrl),
-      ]);
+      const includeBranding = !brandingHidden();
+      const logoSource = resolveThemeLogoUrl();
+      const imgElements = await Promise.all(cellImages.map(({ url }) => loadImg(url)));
+      const logoImg = includeBranding
+        ? await loadImg(logoSource).catch(() => loadImg(logoUrl)).catch(() => null)
+        : null;
 
       const cellW = Math.max(...imgElements.map(img => img.naturalWidth));
       const cellH = Math.max(...imgElements.map(img => img.naturalHeight));
@@ -1367,11 +1407,11 @@
       const labelFont = `600 ${fontSize}px sans-serif`;
       const labelH = fontSize + 10;
 
-      // Reserve footer space for the watermark below the grid
+      // Reserve footer space for the watermark below the grid (when branding is enabled)
       const wmSize = Math.max(20, Math.round(cellW * 0.045));
       const wmFont = `600 ${Math.round(wmSize * 0.8)}px sans-serif`;
       const wmPad = Math.round(wmSize * 0.5);
-      const footerH = wmSize + wmPad * 2 + wmPad;
+      const footerH = includeBranding ? wmSize + wmPad * 2 + wmPad : 0;
 
       const totalW = cols * cellW + (cols - 1) * gap;
       const totalH = rows * (labelH + cellH) + (rows - 1) * gap + footerH;
@@ -1407,29 +1447,30 @@
         ctx.drawImage(img, x + ox, y + labelH + oy);
       }
 
-      // Single MooshieUI watermark in the footer area below the grid
-      ctx.font = wmFont;
-      const textW = ctx.measureText("MooshieUI").width;
-      const pillW = wmSize + 6 + textW + wmPad * 2;
-      const pillH = wmSize + wmPad;
-      const gridBottom = rows * (labelH + cellH) + (rows - 1) * gap;
-      const pillX = wmPad;
-      const pillY = gridBottom + (footerH - pillH) / 2;
+      if (includeBranding && logoImg) {
+        ctx.font = wmFont;
+        const textW = ctx.measureText("MooshieUI").width;
+        const pillW = wmSize + 6 + textW + wmPad * 2;
+        const pillH = wmSize + wmPad;
+        const gridBottom = rows * (labelH + cellH) + (rows - 1) * gap;
+        const pillX = wmPad;
+        const pillY = gridBottom + (footerH - pillH) / 2;
 
-      ctx.fillStyle = "rgba(0, 0, 0, 0.6)";
-      ctx.beginPath();
-      ctx.roundRect(pillX, pillY, pillW, pillH, 6);
-      ctx.fill();
+        ctx.fillStyle = "rgba(0, 0, 0, 0.6)";
+        ctx.beginPath();
+        ctx.roundRect(pillX, pillY, pillW, pillH, 6);
+        ctx.fill();
 
-      const lx = pillX + wmPad;
-      const ly = pillY + (pillH - wmSize) / 2;
-      ctx.drawImage(logoImg, lx, ly, wmSize, wmSize);
+        const lx = pillX + wmPad;
+        const ly = pillY + (pillH - wmSize) / 2;
+        ctx.drawImage(logoImg, lx, ly, wmSize, wmSize);
 
-      ctx.font = wmFont;
-      ctx.fillStyle = "rgba(255, 255, 255, 0.85)";
-      ctx.textAlign = "left";
-      ctx.textBaseline = "middle";
-      ctx.fillText("MooshieUI", lx + wmSize + 6, pillY + pillH / 2);
+        ctx.font = wmFont;
+        ctx.fillStyle = "rgba(255, 255, 255, 0.85)";
+        ctx.textAlign = "left";
+        ctx.textBaseline = "middle";
+        ctx.fillText("MooshieUI", lx + wmSize + 6, pillY + pillH / 2);
+      }
 
       const gridBlob = await new Promise<Blob>((resolve, reject) => {
         cvs.toBlob(
@@ -1551,7 +1592,7 @@
     // Apply UI preferences (theme, font scale) immediately
     try {
       const cfg = await getConfig();
-      applyTheme(cfg.theme);
+      applyTheme(cfg);
       applyFontScale(cfg.font_scale);
       autoStartEnabled = cfg.auto_start !== false;
       comfyServerUrl = cfg.server_url || `http://127.0.0.1:${cfg.server_port ?? 8188}`;
@@ -1675,11 +1716,16 @@
         // node=null handler can await it before consuming pendingOutputImages.
         const data = event.payload;
         console.log("[output_image] event received — format:", data.format, "temp_filename:", data.temp_filename, "display_temp:", data.display_temp_filename, "jxl_image?:", !!data.jxl_image, "image?:", !!data.image, "isGenerating:", progress.isGenerating);
+
+        const pid = data.prompt_id ?? progress.activePromptId;
+        if (typeof data.temp_filename === "string" && data.temp_filename.trim() && pid) {
+          progress.registerPromptOutput(pid, data.temp_filename);
+        }
+
         if (!progress.isGenerating) return;
         // Filter by prompt_id — reject events for other users' prompts
         if (data.prompt_id && !progress.pendingPrompts.some((p: any) => p.promptId === data.prompt_id)) return;
 
-        const pid = data.prompt_id ?? progress.activePromptId;
         if (!pid) return;
 
         if (data.bit_depth === 16) {
@@ -1865,8 +1911,19 @@
           promptLastActivity.delete(promptId);
           if (item) {
             const images = pendingOutputImages.get(promptId) ?? [];
+            for (const img of images) {
+              const tempFn = img.tempFilename?.trim();
+              if (tempFn) progress.registerPromptOutput(promptId, tempFn);
+            }
             pendingOutputImages.delete(promptId);
-            finalizeOutputImages(promptId, item.mode, item.wasUpscaled, item.params, images);
+
+            const skipGallery = shouldSuppressRegionalChainGallerySave(promptId);
+            if (skipGallery) {
+              clearRegionalChainGallerySuppress(promptId);
+              console.log("[regional] Skipping gallery save for chain intermediate:", promptId);
+            } else {
+              finalizeOutputImages(promptId, item.mode, item.wasUpscaled, item.params, images);
+            }
 
             // Track grid batch completion — stitch when all cells are done
             if (images.length > 0 && compare.isGridPrompt(promptId)) {
@@ -1931,15 +1988,29 @@
       try {
         const q = await getQueue();
         const allPromptIds = new Set<string>();
+        const queueOrder: string[] = [];
         for (const item of [...q.queue_running, ...q.queue_pending]) {
           // ComfyUI queue entries: [number, prompt_id, ...] or {prompt_id: ...}
           const pid = Array.isArray(item)
             ? (item[1] as string)
             : (item as any)?.prompt_id;
-          if (pid) allPromptIds.add(pid);
+          if (pid) {
+            allPromptIds.add(pid);
+            queueOrder.push(pid);
+          }
         }
+        const queueTotal = queueOrder.length;
+        progress.resetQueuePosition();
         const now = Date.now();
         for (const p of progress.pendingPrompts) {
+          // Keep queue position synced from the merged ComfyUI queue, not just
+          // the internal fair-queue tracker. This avoids showing "Preparing..."
+          // while this prompt is waiting behind existing external jobs.
+          const queueIndex = queueOrder.indexOf(p.promptId);
+          if (queueIndex >= 0) {
+            progress.updateQueuePosition(p.promptId, queueIndex, queueTotal);
+          }
+
           // Skip prompts that received an SSE event within the last 30s —
           // they're clearly still alive even if the queue query missed them.
           // Fall back to enqueuedAt so brand-new prompts (not yet in ComfyUI's
@@ -1961,6 +2032,10 @@
             promptLastActivity.delete(p.promptId);
             if (item) {
               let images = pendingOutputImages.get(p.promptId) ?? [];
+              for (const img of images) {
+                const tempFn = img.tempFilename?.trim();
+                if (tempFn) progress.registerPromptOutput(p.promptId, tempFn);
+              }
               pendingOutputImages.delete(p.promptId);
 
               if (images.length === 0) {
@@ -1970,6 +2045,8 @@
                 try {
                   const recovered = await recoverPromptOutputs(p.promptId);
                   for (const imgRef of recovered.images) {
+                    const tempFn = imgRef.temp_filename?.trim();
+                    if (tempFn) progress.registerPromptOutput(p.promptId, tempFn);
                     try {
                       const resp = await fetch(
                         `/internal-api/_temp_image/${encodeURIComponent(imgRef.temp_filename)}`,
@@ -1986,7 +2063,13 @@
               }
 
               if (images.length > 0) {
-                finalizeOutputImages(p.promptId, item.mode, item.wasUpscaled, item.params, images);
+                const skipGallery = shouldSuppressRegionalChainGallerySave(p.promptId);
+                if (skipGallery) {
+                  clearRegionalChainGallerySuppress(p.promptId);
+                  console.log("[regional] Skipping gallery save for chain intermediate:", p.promptId);
+                } else {
+                  finalizeOutputImages(p.promptId, item.mode, item.wasUpscaled, item.params, images);
+                }
               } else {
                 gallery.showToast(locale.t("app.generation_lost"), "error");
               }
@@ -2051,9 +2134,8 @@
     // Load persisted gallery images from disk (independent of server status)
     gallery.loadFromDisk();
 
-    // Warm the artist-tag detection index in the background so thumbnail
-    // badges and "Sort by artist" work without an explicit fetch later.
-    void gallery.loadArtistIndex(connection.artistGalleryManifestUrl);
+    // Skip warming the large artist index during startup so prompt input stays responsive.
+    // Artist-specific affordances can wait until a gallery flow actually needs the index.
   }
 
   $effect(() => {
@@ -2114,8 +2196,8 @@
     <!-- Forced password change screen -->
     <div class="flex items-center justify-center h-full bg-neutral-950">
       <div class="w-80 space-y-4">
-        <div class="flex items-center justify-center gap-3 mb-6">
-          <img src={logoUrl} alt="MooshieUI" class="w-10 h-10 rounded-lg" />
+        <div class="mooshie-branding flex items-center justify-center gap-3 mb-6">
+          <img src={themeLogoUrl} alt="MooshieUI" class="w-10 h-10 aspect-square object-contain rounded-lg" />
           <h1 class="text-xl font-bold text-neutral-100">MooshieUI</h1>
         </div>
         <p class="text-sm text-neutral-400 text-center">{locale.t("auth.password_reset_by_admin")}</p>
@@ -2150,8 +2232,8 @@
   <!-- Login gate for LAN users -->
   <div class="flex items-center justify-center h-full bg-neutral-950">
     <div class="w-80 space-y-4">
-      <div class="flex items-center justify-center gap-3 mb-6">
-        <img src={logoUrl} alt="MooshieUI" class="w-10 h-10 rounded-lg" />
+      <div class="mooshie-branding flex items-center justify-center gap-3 mb-6">
+        <img src={themeLogoUrl} alt="MooshieUI" class="w-10 h-10 aspect-square object-contain rounded-lg" />
         <h1 class="text-xl font-bold text-neutral-100">MooshieUI</h1>
       </div>
       <p class="text-sm text-neutral-400 text-center">{locale.t("auth.sign_in_continue")}</p>
@@ -2224,10 +2306,22 @@
     </defs>
   </svg>
 
-  <!-- Sidebar -->
-  <nav
-    class="flex w-14 shrink-0 flex-col items-stretch gap-1.5 border-r border-neutral-800 bg-neutral-900 px-1.5 py-3 md:rounded-2xl md:border md:shadow-2xl md:shadow-black/30"
-  >
+  <!-- Sidebar column: logo panel + nav -->
+  <div class="flex w-14 shrink-0 flex-col gap-1.5 self-stretch md:gap-3">
+    <div
+      class="theme-logo-panel flex shrink-0 items-center justify-center border-r border-neutral-800 bg-neutral-900 px-1.5 py-2 md:rounded-2xl md:border md:shadow-2xl md:shadow-black/30"
+    >
+      <div
+        class="flex size-8 items-center justify-center rounded-lg bg-neutral-800/60 text-neutral-400"
+        title="Theme logo"
+      >
+        <img src={themeLogoUrl} alt="Theme logo" class="size-7 rounded-md object-contain" />
+      </div>
+    </div>
+
+    <nav
+      class="flex min-h-0 flex-1 flex-col items-stretch gap-1.5 border-r border-neutral-800 bg-neutral-900 px-1.5 py-3 md:rounded-2xl md:border md:shadow-2xl md:shadow-black/30"
+    >
     <div class="relative mx-auto">
       <button
         class="w-8 h-8 rounded-lg flex items-center justify-center transition-colors {currentPage ===
@@ -2383,26 +2477,20 @@
       title={connection.connected ? locale.t('nav.connected') : startupStatus || locale.t('nav.disconnected')}
     ></div>
 
-    <!-- svelte-ignore a11y_no_static_element_interactions a11y_click_events_have_key_events -->
     <span
-      class="text-[10px] text-neutral-500 text-center mb-2 select-none cursor-default"
-      onclick={() => {
-        if (currentPage !== 'settings') return;
-        versionTapCount++;
-        if (versionTapCount >= 10) {
-          versionTapCount = 0;
-          if (generation.devModeUnlocked) {
-            generation.devModeUnlocked = false;
-            generation.devMode = false;
-            gallery.showToast(locale.t("app.dev_mode_disabled"), "info");
-          } else {
-            generation.devModeUnlocked = true;
-            gallery.showToast(locale.t("app.dev_mode_unlocked"), "success");
-          }
+      class="mooshie-branding text-[10px] text-neutral-500 text-center mb-2 select-none cursor-default"
+      role="button"
+      tabindex="0"
+      onclick={handleVersionTap}
+      onkeydown={(e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          handleVersionTap();
         }
       }}
     >v{appVersion}</span>
-  </nav>
+    </nav>
+  </div>
 
   <!-- Main content -->
   <main class="flex min-w-0 flex-1 flex-col overflow-hidden md:rounded-2xl md:border md:border-neutral-800 md:bg-neutral-900 md:p-1 md:shadow-2xl md:shadow-black/30">
@@ -2588,7 +2676,10 @@
     <!-- Image area -->
     <div
       class="flex-1 h-full flex items-center justify-center relative"
+      role="button"
+      tabindex="0"
       onclick={(e) => { if (e.target === e.currentTarget) gallery.closeLightbox(); }}
+      onkeydown={handleLightboxAreaKeydown}
     >
       <!-- Close button -->
       <button

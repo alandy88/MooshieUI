@@ -1,12 +1,15 @@
 <script lang="ts">
-  import { onDestroy } from "svelte";
+  import { onDestroy, untrack } from "svelte";
+  import { on } from "svelte/events";
   import { autocomplete, type TagEntry } from "../../stores/autocomplete.svelte.js";
   import { locale } from "../../stores/locale.svelte.js";
   import { generation } from "../../stores/generation.svelte.js";
-  import { connection } from "../../stores/connection.svelte.js";
   import { promptPresets } from "../../stores/promptPresets.svelte.js";
-  import ArtistHoverPreview from "../../artist-gallery/components/ArtistHoverPreview.svelte";
   import { renderHighlightedPrompt, hasSchedulingTags, hasPresetTokens } from "../../utils/promptSchedule.js";
+  import {
+    getPromptClickableSegments,
+    type PromptClickableSegment,
+  } from "../../utils/promptClickableRanges.js";
 
   interface Props {
     value: string;
@@ -33,16 +36,36 @@
 
   let textareaEl = $state<HTMLTextAreaElement | null>(null);
   let backdropEl = $state<HTMLDivElement | null>(null);
+  let clickOverlayEl = $state<HTMLDivElement | null>(null);
   let suggestions = $state<TagEntry[]>([]);
   let selectedIndex = $state(0);
   let showSuggestions = $state(false);
   let dropdownTop = $state(0);
   let dropdownLeft = $state(0);
-  let suggestionTimer: number | null = null;
+  let suggestionTimer: ReturnType<typeof setTimeout> | null = null;
+
+  const DROPDOWN_WIDTH = 320; // w-80
+  const DROPDOWN_MAX_HEIGHT = 240; // max-h-60
+  const VIEWPORT_MARGIN = 8;
+  const PANEL_GAP = 8;
+  const SUGGEST_DEBOUNCE_MS = 60;
 
   // Undo/redo stacks for autocomplete insertions
   let undoStack = $state<string[]>([]);
   let redoStack = $state<string[]>([]);
+  let categoryFilter = $state<number | null>(null);
+  let selectionStart = $state(0);
+  let selectionEnd = $state(0);
+  const hasSelection = $derived(selectionStart !== selectionEnd);
+
+  const categoryOptions = $derived([
+    { value: null, label: locale.t("generation.prompt.category_all") },
+    { value: 0, label: locale.t("generation.prompt.category_general") },
+    { value: 1, label: locale.t("generation.prompt.category_artist") },
+    { value: 3, label: locale.t("generation.prompt.category_copyright") },
+    { value: 4, label: locale.t("generation.prompt.category_character") },
+    { value: 5, label: locale.t("generation.prompt.category_meta") },
+  ]);
 
   const CATEGORY_COLORS: Record<number, string> = {
     0: "text-indigo-300",   // general
@@ -142,10 +165,7 @@
       return;
     }
 
-    const raw = autocomplete.search(searchFragment);
-    // Filter out exact matches — don't suggest a tag that's already fully typed
-    const normalizedFragment = searchFragment.replace(/_/g, " ").replace(/\\/g, "").toLowerCase();
-    suggestions = raw.filter(tag => tag.n.replace(/_/g, " ").toLowerCase() !== normalizedFragment);
+    suggestions = autocomplete.search(searchFragment, autocomplete.maxResults, categoryFilter);
     selectedIndex = 0;
     showSuggestions = suggestions.length > 0;
 
@@ -157,9 +177,22 @@
   function positionDropdown() {
     if (!textareaEl) return;
     const rect = textareaEl.getBoundingClientRect();
-    // Position below the textarea
-    dropdownTop = rect.bottom + 4;
-    dropdownLeft = rect.left;
+    const viewportWidth = window.innerWidth;
+    const viewportHeight = window.innerHeight;
+    const textareaCenterX = rect.left + rect.width / 2;
+    const isLeftPanel = textareaCenterX < viewportWidth / 2;
+
+    const minLeft = VIEWPORT_MARGIN;
+    const maxLeft = Math.max(VIEWPORT_MARGIN, viewportWidth - VIEWPORT_MARGIN - DROPDOWN_WIDTH);
+    const desiredDropdownLeft = isLeftPanel
+      ? rect.right + PANEL_GAP
+      : rect.left - DROPDOWN_WIDTH - PANEL_GAP;
+    dropdownLeft = Math.min(Math.max(desiredDropdownLeft, minLeft), maxLeft);
+
+    const minTop = VIEWPORT_MARGIN;
+    const maxTop = Math.max(VIEWPORT_MARGIN, viewportHeight - VIEWPORT_MARGIN - DROPDOWN_MAX_HEIGHT);
+    const desiredDropdownTop = rect.top;
+    dropdownTop = Math.min(Math.max(desiredDropdownTop, minTop), maxTop);
   }
 
   function acceptSuggestion(tag: TagEntry) {
@@ -203,7 +236,66 @@
     requestAnimationFrame(() => {
       textareaEl?.focus();
       textareaEl?.setSelectionRange(cursorPos, cursorPos);
+      syncSelectionRange();
     });
+  }
+
+  function syncSelectionRange() {
+    if (!textareaEl) return;
+    selectionStart = textareaEl.selectionStart;
+    selectionEnd = textareaEl.selectionEnd;
+  }
+
+  function wrapSelection(braceKey: "brace" | "bracket") {
+    if (!textareaEl || selectionStart === selectionEnd) return;
+    const start = selectionStart;
+    const end = selectionEnd;
+    const selected = value.substring(start, end);
+
+    if (braceKey === "bracket" && selected.startsWith("{") && selected.endsWith("}")) {
+      undoStack = [...undoStack, value];
+      redoStack = [];
+      const inner = selected.slice(1, -1);
+      value = value.substring(0, start) + inner + value.substring(end);
+      requestAnimationFrame(() => {
+        textareaEl?.focus();
+        textareaEl?.setSelectionRange(start, start + inner.length);
+        syncSelectionRange();
+      });
+      return;
+    }
+
+    if (braceKey === "brace" && selected.startsWith("[") && selected.endsWith("]")) {
+      undoStack = [...undoStack, value];
+      redoStack = [];
+      const inner = selected.slice(1, -1);
+      value = value.substring(0, start) + inner + value.substring(end);
+      requestAnimationFrame(() => {
+        textareaEl?.focus();
+        textareaEl?.setSelectionRange(start, start + inner.length);
+        syncSelectionRange();
+      });
+      return;
+    }
+
+    const open = braceKey === "brace" ? "{" : "[";
+    const close = braceKey === "brace" ? "}" : "]";
+    const wrapped = `${open}${selected}${close}`;
+    undoStack = [...undoStack, value];
+    redoStack = [];
+    value = value.substring(0, start) + wrapped + value.substring(end);
+    requestAnimationFrame(() => {
+      textareaEl?.focus();
+      textareaEl?.setSelectionRange(start, start + wrapped.length);
+      syncSelectionRange();
+    });
+  }
+
+  function adjustSelectedWeight(delta: number) {
+    if (!textareaEl || selectionStart === selectionEnd) return;
+    undoStack = [...undoStack, value];
+    redoStack = [];
+    adjustWeight(delta, selectionStart, selectionEnd);
   }
 
   function undo() {
@@ -212,6 +304,7 @@
     const prev = undoStack[undoStack.length - 1];
     undoStack = undoStack.slice(0, -1);
     value = prev;
+    requestAnimationFrame(syncSelectionRange);
   }
 
   function redo() {
@@ -220,6 +313,7 @@
     const next = redoStack[redoStack.length - 1];
     redoStack = redoStack.slice(0, -1);
     value = next;
+    requestAnimationFrame(syncSelectionRange);
   }
 
   function handleKeydown(e: KeyboardEvent) {
@@ -260,47 +354,8 @@
       const end = textareaEl.selectionEnd;
       if (start !== end) {
         e.preventDefault();
-        const selected = value.substring(start, end);
         const braceKey = (e.key === "{" || e.key === "}") ? "brace" : "bracket";
-
-        // If pressing [ or ] and selection is already wrapped in {}, strip one layer of {}
-        if (braceKey === "bracket" && selected.startsWith("{") && selected.endsWith("}")) {
-          // Push current value to undo stack before modifying
-          undoStack = [...undoStack, value];
-          redoStack = [];
-          const inner = selected.slice(1, -1);
-          value = value.substring(0, start) + inner + value.substring(end);
-          requestAnimationFrame(() => {
-            textareaEl?.focus();
-            textareaEl?.setSelectionRange(start, start + inner.length);
-          });
-          return;
-        }
-
-        // If pressing { or } and selection is already wrapped in [], strip one layer of []
-        if (braceKey === "brace" && selected.startsWith("[") && selected.endsWith("]")) {
-          undoStack = [...undoStack, value];
-          redoStack = [];
-          const inner = selected.slice(1, -1);
-          value = value.substring(0, start) + inner + value.substring(end);
-          requestAnimationFrame(() => {
-            textareaEl?.focus();
-            textareaEl?.setSelectionRange(start, start + inner.length);
-          });
-          return;
-        }
-
-        // Normal wrap: surround with the appropriate bracket pair
-        const open = braceKey === "brace" ? "{" : "[";
-        const close = braceKey === "brace" ? "}" : "]";
-        const wrapped = `${open}${selected}${close}`;
-        undoStack = [...undoStack, value];
-        redoStack = [];
-        value = value.substring(0, start) + wrapped + value.substring(end);
-        requestAnimationFrame(() => {
-          textareaEl?.focus();
-          textareaEl?.setSelectionRange(start, start + wrapped.length);
-        });
+        wrapSelection(braceKey);
         return;
       }
     }
@@ -368,30 +423,36 @@
     requestAnimationFrame(() => {
       textareaEl?.focus();
       textareaEl?.setSelectionRange(start, start + newText.length);
+      syncSelectionRange();
     });
   }
 
-  function handleInput() {
-    // Clear redo stack on manual edits (standard undo behavior)
-    redoStack = [];
-
+  function scheduleUpdateSuggestions() {
     if (suggestionTimer !== null) {
-      window.clearTimeout(suggestionTimer);
+      clearTimeout(suggestionTimer);
     }
-
-    suggestionTimer = window.setTimeout(() => {
-      updateSuggestions();
+    suggestionTimer = setTimeout(() => {
       suggestionTimer = null;
-    }, 20);
+      updateSuggestions();
+    }, SUGGEST_DEBOUNCE_MS);
+  }
+
+  function handleInput() {
+    redoStack = [];
+    syncSelectionRange();
+    scheduleUpdateSuggestions();
   }
 
   function handleClick() {
-    requestAnimationFrame(updateSuggestions);
+    requestAnimationFrame(() => {
+      syncSelectionRange();
+      scheduleUpdateSuggestions();
+    });
   }
 
   function handleBlur() {
     if (suggestionTimer !== null) {
-      window.clearTimeout(suggestionTimer);
+      clearTimeout(suggestionTimer);
       suggestionTimer = null;
     }
 
@@ -406,11 +467,37 @@
 
   // Reactive: render highlighted HTML for the backdrop overlay
   const highlightedHtml = $derived(showBackdrop ? renderHighlightedPrompt(value, promptPresets.slugs) : "");
+  const clickableSegments = $derived(
+    autocomplete.clickableOverlayEnabled ? getPromptClickableSegments(value) : [],
+  );
+  const showClickableOverlay = $derived(autocomplete.clickableOverlayEnabled && clickableSegments.length > 0);
+
+  function handleClickableSegmentMouseDown(event: MouseEvent, segment: PromptClickableSegment) {
+    if (!textareaEl || !segment.clickable) return;
+
+    event.preventDefault();
+    event.stopPropagation();
+
+    if (suggestionTimer !== null) {
+      clearTimeout(suggestionTimer);
+      suggestionTimer = null;
+    }
+
+    showSuggestions = false;
+    suggestions = [];
+    textareaEl.focus();
+    textareaEl.setSelectionRange(segment.start, segment.end);
+    syncSelectionRange();
+  }
 
   function syncScroll() {
     if (textareaEl && backdropEl) {
       backdropEl.scrollTop = textareaEl.scrollTop;
       backdropEl.scrollLeft = textareaEl.scrollLeft;
+    }
+    if (textareaEl && clickOverlayEl) {
+      clickOverlayEl.scrollTop = textareaEl.scrollTop;
+      clickOverlayEl.scrollLeft = textareaEl.scrollLeft;
     }
   }
 
@@ -439,46 +526,204 @@
 
   onDestroy(() => {
     if (suggestionTimer !== null) {
-      window.clearTimeout(suggestionTimer);
+      clearTimeout(suggestionTimer);
+      suggestionTimer = null;
     }
     resizeObserver?.disconnect();
+  });
+
+  /** Teleport overlays to body so fixed positioning escapes panel overflow/transform containers. */
+  function portal(node: HTMLElement) {
+    document.body.appendChild(node);
+    return {
+      destroy() {
+        node.remove();
+      },
+    };
+  }
+
+  // Portalled dropdown nodes cannot rely on delegated listeners, so bind directly.
+  function bindCategoryButton(node: HTMLButtonElement, value: number | null) {
+    const offMouseDown = on(node, "mousedown", (e) => e.preventDefault());
+    const offClick = on(node, "click", () => {
+      categoryFilter = value;
+    });
+    return {
+      update(nextValue: number | null) {
+        value = nextValue;
+      },
+      destroy() {
+        offMouseDown();
+        offClick();
+      },
+    };
+  }
+
+  function bindSuggestionButton(node: HTMLButtonElement, initial: { tag: TagEntry; index: number }) {
+    let current = initial;
+    const offMouseDown = on(node, "mousedown", (e) => {
+      e.preventDefault();
+      acceptSuggestion(current.tag);
+    });
+    const offMouseEnter = on(node, "mouseenter", () => {
+      selectedIndex = current.index;
+    });
+    return {
+      update(next: { tag: TagEntry; index: number }) {
+        current = next;
+      },
+      destroy() {
+        offMouseDown();
+        offMouseEnter();
+      },
+    };
+  }
+
+  $effect(() => {
+    if (!showSuggestions) return;
+    const reposition = () => positionDropdown();
+    window.addEventListener("scroll", reposition, true);
+    window.addEventListener("resize", reposition);
+    return () => {
+      window.removeEventListener("scroll", reposition, true);
+      window.removeEventListener("resize", reposition);
+    };
+  });
+
+  $effect(() => {
+    // Only re-run when categoryFilter changes; avoid re-tracking value/showSuggestions
+    // (handleInput already drives updateSuggestions on typing).
+    categoryFilter;
+    untrack(() => {
+      if (showSuggestions) {
+        updateSuggestions();
+      }
+    });
   });
 </script>
 
 <div class="relative">
-  {#if showBackdrop}
-    <div
-      bind:this={backdropEl}
-      class="absolute inset-0 pointer-events-none overflow-hidden rounded-lg px-3 py-2 text-sm whitespace-pre-wrap break-words border border-transparent"
-      style="color: transparent; z-index: 0;"
-    >{@html highlightedHtml}</div>
+  {#if hasSelection}
+    <div class="mb-2 flex flex-wrap gap-1.5">
+      <button
+        type="button"
+        class="rounded border border-neutral-700 bg-neutral-900 px-2 py-1 text-[11px] text-neutral-300 hover:border-indigo-500 hover:text-indigo-300 transition-colors"
+        title={locale.t('generation.prompt.weight_up')}
+        onmousedown={(e) => e.preventDefault()}
+        onclick={() => adjustSelectedWeight(0.05)}
+      >
+        +0.05
+      </button>
+      <button
+        type="button"
+        class="rounded border border-neutral-700 bg-neutral-900 px-2 py-1 text-[11px] text-neutral-300 hover:border-indigo-500 hover:text-indigo-300 transition-colors"
+        title={locale.t('generation.prompt.weight_down')}
+        onmousedown={(e) => e.preventDefault()}
+        onclick={() => adjustSelectedWeight(-0.05)}
+      >
+        -0.05
+      </button>
+      <button
+        type="button"
+        class="rounded border border-neutral-700 bg-neutral-900 px-2 py-1 text-[11px] text-neutral-300 hover:border-indigo-500 hover:text-indigo-300 transition-colors"
+        title={locale.t('generation.prompt.wrap_stronger')}
+        onmousedown={(e) => e.preventDefault()}
+        onclick={() => wrapSelection("brace")}
+      >
+        &#123;&#125;
+      </button>
+      <button
+        type="button"
+        class="rounded border border-neutral-700 bg-neutral-900 px-2 py-1 text-[11px] text-neutral-300 hover:border-indigo-500 hover:text-indigo-300 transition-colors"
+        title={locale.t('generation.prompt.wrap_weaker')}
+        onmousedown={(e) => e.preventDefault()}
+        onclick={() => wrapSelection("bracket")}
+      >
+        []
+      </button>
+    </div>
   {/if}
+  <div class="relative">
+    {#if showBackdrop}
+      <div
+        bind:this={backdropEl}
+        class="absolute inset-0 pointer-events-none overflow-hidden rounded-lg px-3 py-2 text-sm leading-5 whitespace-pre-wrap break-words border border-transparent"
+        style="color: transparent; z-index: 0;"
+      >{@html highlightedHtml}</div>
+    {/if}
 
-  <textarea
-    bind:this={textareaEl}
-    bind:value
-    {placeholder}
-    {rows}
-    class="w-full border border-neutral-700 rounded-lg px-3 py-2 text-sm text-neutral-100 placeholder-neutral-500 resize-y focus:outline-none focus:border-indigo-500 transition-colors {minHeight} {showBackdrop ? 'bg-transparent' : 'bg-neutral-800'}"
-    style="position: relative; z-index: 1; {resizeStyle}{showBackdrop ? 'caret-color: #e5e5e5;' : ''}"
-    onkeydown={handleKeydown}
-    oninput={handleInput}
-    onclick={handleClick}
-    onblur={handleBlur}
-    onscroll={syncScroll}
-  ></textarea>
+    <textarea
+      bind:this={textareaEl}
+      bind:value
+      {placeholder}
+      {rows}
+      class="w-full border border-neutral-700 rounded-lg px-3 py-2 text-sm leading-5 text-neutral-100 placeholder-neutral-500 resize-y focus:outline-none focus:border-indigo-500 transition-colors break-words {minHeight} {showBackdrop ? 'bg-transparent' : 'bg-neutral-800'}"
+      style="position: relative; z-index: 1; {resizeStyle}{showBackdrop ? 'caret-color: #e5e5e5;' : ''}"
+      onkeydown={handleKeydown}
+      oninput={handleInput}
+      onclick={handleClick}
+        onselect={syncSelectionRange}
+        onkeyup={syncSelectionRange}
+      onblur={handleBlur}
+      onscroll={syncScroll}
+    ></textarea>
+
+    {#if showClickableOverlay}
+      <div
+        bind:this={clickOverlayEl}
+        aria-hidden="true"
+        class="absolute inset-0 overflow-hidden rounded-lg px-3 py-2 text-sm leading-5 whitespace-pre-wrap break-words border border-transparent select-none"
+        style="pointer-events: none; color: transparent; z-index: 2;"
+      >
+        {#each clickableSegments as segment (segment.start + ':' + segment.end + ':' + segment.kind)}
+          {#if segment.clickable}
+            <!-- svelte-ignore a11y_no_static_element_interactions -->
+            <span
+              class="pointer-events-auto cursor-pointer rounded-[4px] transition-colors box-decoration-clone {selectionStart === segment.start && selectionEnd === segment.end
+                ? segment.kind === 'weighted'
+                  ? 'bg-amber-400/28 shadow-[inset_0_0_0_1px_rgba(252,211,77,0.8),0_0_10px_rgba(251,191,36,0.35)]'
+                  : 'bg-indigo-400/24 shadow-[inset_0_0_0_1px_rgba(165,180,252,0.8),0_0_10px_rgba(129,140,248,0.35)]'
+                : segment.kind === 'weighted'
+                  ? 'bg-amber-500/16 hover:bg-amber-500/22 shadow-[inset_0_0_0_1px_rgba(245,158,11,0.4)] hover:shadow-[inset_0_0_0_1px_rgba(251,191,36,0.55)]'
+                  : 'hover:bg-indigo-500/18 hover:shadow-[inset_0_0_0_1px_rgba(129,140,248,0.5)]'}"
+              style="color: transparent;"
+              onmousedown={(event) => handleClickableSegmentMouseDown(event, segment)}
+            >{value.slice(segment.start, segment.end)}</span>
+          {:else}
+            <span style="color: transparent;">{value.slice(segment.start, segment.end)}</span>
+          {/if}
+        {/each}
+      </div>
+    {/if}
+  </div>
 
   {#if showSuggestions}
     <div
-      class="fixed z-50 w-80 max-h-60 overflow-y-auto bg-neutral-800 border border-neutral-600 rounded-lg shadow-xl"
+      use:portal
+      class="fixed z-[200] w-80 max-h-60 overflow-y-auto bg-neutral-800 border border-neutral-600 rounded-lg shadow-xl"
       style="top: {dropdownTop}px; left: {dropdownLeft}px;"
     >
-      {#each suggestions as tag, i}
+      <div class="sticky top-0 z-10 border-b border-neutral-700 bg-neutral-800/95 p-2 backdrop-blur-sm">
+        <div class="flex flex-wrap gap-1">
+          {#each categoryOptions as option (option.value ?? "all")}
+            <button
+              type="button"
+              class="rounded-full border px-2 py-0.5 text-[10px] transition-colors cursor-pointer {categoryFilter === option.value
+                ? 'border-indigo-500/60 bg-indigo-500/15 text-indigo-200'
+                : 'border-neutral-700 text-neutral-400 hover:border-neutral-500 hover:text-neutral-200'}"
+              use:bindCategoryButton={option.value}
+            >
+              {option.label}
+            </button>
+          {/each}
+        </div>
+      </div>
+      {#each suggestions as tag, i (tag.n)}
         <button
+          type="button"
           class="w-full text-left px-3 py-1.5 text-sm flex items-center justify-between gap-2 transition-colors cursor-pointer
             {i === selectedIndex ? 'bg-indigo-600/40 text-white' : 'text-neutral-300 hover:bg-neutral-700'}"
-          onmousedown={(e) => { e.preventDefault(); acceptSuggestion(tag); }}
-          onmouseenter={() => { selectedIndex = i; }}
+          use:bindSuggestionButton={{ tag, index: i }}
         >
           <span class={CATEGORY_COLORS[tag.c] ?? "text-neutral-300"}>
             {formatTagForDisplay(tag.n)}
@@ -487,16 +732,5 @@
         </button>
       {/each}
     </div>
-    {#if suggestions[selectedIndex]?.c === 1 && connection.artistGalleryManifestUrl}
-      <div
-        class="fixed z-50 pointer-events-none"
-        style="top: {dropdownTop}px; left: {dropdownLeft + 328}px;"
-      >
-        <ArtistHoverPreview
-          manifestUrl={connection.artistGalleryManifestUrl}
-          slugOrTag={suggestions[selectedIndex].n}
-        />
-      </div>
-    {/if}
   {/if}
 </div>
