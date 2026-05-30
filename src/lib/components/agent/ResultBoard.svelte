@@ -1,0 +1,141 @@
+<script lang="ts">
+  import { results } from "../../stores/results.svelte.js";
+  import { progress } from "../../stores/progress.svelte.js";
+  import { generation } from "../../stores/generation.svelte.js";
+  import { applyRefineDelta } from "../../spec/merge.ts";
+  import type { Result } from "../../spec/result.ts";
+
+  interface Props {
+    /** Fix-hand reuses the page's inpaint + mask-editor machinery (Konva + facefix). */
+    onFixHand?: (result: Result) => void;
+  }
+  let { onFixHand }: Props = $props();
+
+  /** Live preview routing: a pending card shows the WS preview while it's active. */
+  function previewFor(promptId: string): string | null {
+    return progress.activePromptId === promptId ? progress.previewImage : null;
+  }
+
+  function select(id: string) {
+    results.select(results.activeResultId === id ? null : id);
+  }
+
+  /** Variations ("再来4张"): same composition, fresh seeds, a batch of 4. */
+  function variations(result: Result) {
+    const base = results.refineBase(result.id);
+    if (!base) return;
+    generation.applySpec(
+      applyRefineDelta(base, {
+        profile: "",
+        parent: result.id,
+        sampling: { seed: -1 },
+        dimensions: { batch: 4 },
+      }),
+    );
+    results.stageRefine(result.id, "variations");
+    results.select(result.id);
+  }
+
+  /** Promote: pin this exact image's seed and turn on upscale for a full render. */
+  function promote(result: Result) {
+    const base = results.refineBase(result.id);
+    if (!base) return;
+    generation.applySpec(
+      applyRefineDelta(base, {
+        profile: "",
+        parent: result.id,
+        pipeline: { upscale: { enabled: true } },
+      }),
+    );
+    results.stageRefine(result.id, "promote to full render");
+    results.select(result.id);
+  }
+</script>
+
+<div class="flex h-full flex-col bg-neutral-950 text-neutral-100">
+  <div class="flex items-center justify-between border-b border-neutral-800 px-3 py-2 shrink-0">
+    <span class="text-sm font-semibold">Results</span>
+    <span class="text-[11px] text-neutral-500">{results.results.length} on board</span>
+  </div>
+
+  <div class="flex-1 overflow-y-auto p-2">
+    {#if results.results.length === 0 && results.pending.length === 0}
+      <div class="m-auto max-w-[16rem] text-center text-xs text-neutral-500 leading-relaxed pt-8">
+        Generations land here as cards. Click one to select it, then refine in
+        chat — "再来4张", "like this but warmer", "fix the hand".
+      </div>
+    {:else}
+      <div class="grid grid-cols-2 gap-2">
+        {#each results.results as result, i (result.id)}
+          {@const selected = results.activeResultId === result.id}
+          <div
+            role="button"
+            tabindex="0"
+            onclick={() => select(result.id)}
+            onkeydown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); select(result.id); } }}
+            class="group relative aspect-square cursor-pointer overflow-hidden rounded-lg border text-left transition-colors
+              {selected ? 'border-indigo-500 ring-1 ring-indigo-500' : 'border-neutral-800 hover:border-neutral-600'}"
+          >
+            {#if result.image.url}
+              <img src={result.image.url} alt={`Result #${i + 1}`} class="h-full w-full object-cover" />
+            {:else}
+              <div class="flex h-full w-full items-center justify-center bg-neutral-900 text-xs text-neutral-600">no image</div>
+            {/if}
+
+            <!-- top-left: board number -->
+            <span class="absolute left-1 top-1 rounded bg-black/60 px-1.5 py-0.5 text-[10px] font-semibold tabular-nums">
+              #{i + 1}
+            </span>
+            <!-- top-right: verdict badge (Phase 5) -->
+            {#if result.verdict}
+              <span class="absolute right-1 top-1 rounded px-1.5 py-0.5 text-[10px] font-semibold
+                {result.verdict === 'accepted' ? 'bg-emerald-600/80' : result.verdict === 'reject' ? 'bg-red-700/80' : 'bg-amber-600/80'}">
+                {result.verdict}
+              </span>
+            {/if}
+
+            <!-- hover/selected action bar -->
+            <div class="absolute inset-x-0 bottom-0 flex gap-1 bg-gradient-to-t from-black/80 to-transparent p-1
+              opacity-0 transition-opacity group-hover:opacity-100 {selected ? 'opacity-100' : ''}">
+              <button
+                type="button"
+                onclick={(e) => { e.stopPropagation(); variations(result); }}
+                class="flex-1 rounded bg-neutral-800/90 px-1 py-1 text-[10px] hover:bg-indigo-600"
+                title="4 variations (再来4张)"
+              >×4</button>
+              <button
+                type="button"
+                onclick={(e) => { e.stopPropagation(); onFixHand?.(result); }}
+                class="flex-1 rounded bg-neutral-800/90 px-1 py-1 text-[10px] hover:bg-indigo-600"
+                title="Fix by mask (inpaint + face fix)"
+              >fix</button>
+              <button
+                type="button"
+                onclick={(e) => { e.stopPropagation(); promote(result); }}
+                class="flex-1 rounded bg-neutral-800/90 px-1 py-1 text-[10px] hover:bg-indigo-600"
+                title="Promote to full render (pin seed + upscale)"
+              >↑</button>
+            </div>
+          </div>
+        {/each}
+
+        <!-- in-flight cards (live preview routes onto the active one) -->
+        {#each results.pending as p (p.promptId)}
+          {@const preview = previewFor(p.promptId)}
+          <div class="relative aspect-square overflow-hidden rounded-lg border border-neutral-700">
+            {#if preview}
+              <img src={preview} alt="generating" class="h-full w-full object-cover" />
+            {:else}
+              <div class="flex h-full w-full items-center justify-center bg-neutral-900">
+                <span class="h-5 w-5 animate-spin rounded-full border-2 border-neutral-700 border-t-indigo-500"></span>
+              </div>
+            {/if}
+            <span class="absolute left-1 top-1 rounded bg-black/60 px-1.5 py-0.5 text-[10px] text-neutral-300">
+              generating…
+            </span>
+          </div>
+        {/each}
+      </div>
+    {/if}
+  </div>
+</div>

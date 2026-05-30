@@ -1,9 +1,11 @@
 import { generation } from "../stores/generation.svelte.js";
+import { results } from "../stores/results.svelte.js";
 import { readImageMetadataBytes, readImageMetadataPath } from "./api.js";
 import { gallery } from "../stores/gallery.svelte.js";
 import { locale } from "../stores/locale.svelte.js";
 import { readPngMetadataClientSide } from "./pngMetadata.js";
 import { isBrowserMode } from "./ipc.js";
+import type { ResolvedSpec } from "../spec/spec.ts";
 
 /** Section IDs that accept metadata drops */
 export type DroppableSectionId =
@@ -192,8 +194,33 @@ export function applyMetadataToSection(
   }
 }
 
+/**
+ * Re-open a MooshieUI Result embedded in the PNG (Phase 4 — story #46). When the
+ * image carries a `mooshie_result` chunk, the full resolved Spec round-trips back
+ * onto the controls (every pipeline knob, the seed, provenance) — strictly more
+ * faithful than the field-by-field import below. Returns true when it applied.
+ */
+export function applyEmbeddedResult(meta: Record<string, string>): boolean {
+  const raw = meta.mooshie_result;
+  if (!raw) return false;
+  try {
+    const parsed = JSON.parse(raw) as { resolvedSpec?: ResolvedSpec; seed?: number; parent?: string | null };
+    if (!parsed.resolvedSpec) return false;
+    generation.applySpec(parsed.resolvedSpec);
+    // Stage provenance so a follow-up generation references the re-opened work.
+    if (parsed.parent) results.stageRefine(parsed.parent, parsed.resolvedSpec.intent ?? null);
+    else results.stageFresh(parsed.resolvedSpec.intent ?? null);
+    return true;
+  } catch (e) {
+    console.error("Failed to re-open embedded Result:", e);
+    return false;
+  }
+}
+
 /** Apply all applicable metadata. Returns list of section names that were applied. */
 export function applyAllMetadata(meta: Record<string, string>): string[] {
+  // Full-fidelity re-open wins when a MooshieUI Result is embedded.
+  if (applyEmbeddedResult(meta)) return ["result"];
   const applied: string[] = [];
   if (applyPrompts(meta)) applied.push("prompts");
   if (applySampler(meta)) applied.push("sampler");

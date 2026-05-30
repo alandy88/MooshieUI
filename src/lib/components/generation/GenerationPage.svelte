@@ -9,6 +9,9 @@
   import DimensionControls from "./DimensionControls.svelte";
   import GenerateButton from "./GenerateButton.svelte";
   import ChatPanel from "../agent/ChatPanel.svelte";
+  import ResultBoard from "../agent/ResultBoard.svelte";
+  import { results } from "../../stores/results.svelte.js";
+  import type { Result } from "../../spec/result.ts";
   import UpscaleSettings from "./UpscaleSettings.svelte";
   import FaceFixSettings from "./FaceFixSettings.svelte";
   import ControlNetSettings from "./ControlNetSettings.svelte";
@@ -668,6 +671,25 @@
       console.error("Failed to set up inpainting:", e);
       gallery.showToast(locale.t('generation.toast.failed_load'), "error");
     }
+  }
+
+  /**
+   * Fix-hand from a Result card (Phase 4): reuse the existing inpaint + Konva
+   * mask-editor machinery, plus the face-fix detailer chain, on the Result's own
+   * image — and stage refine provenance so the repaired output references it.
+   */
+  async function fixHandFromResult(result: Result) {
+    const image =
+      gallery.sessionImages.find((img) => img.filename === result.image.filename) ??
+      gallery.sessionImages.find((img) => !!img.url && img.url === result.image.url);
+    if (!image) {
+      gallery.showToast(locale.t('generation.toast.failed_load'), "error");
+      return;
+    }
+    await inpaintImage(image);
+    generation.facefixEnabled = true;
+    results.stageRefine(result.id, "fix by mask");
+    results.select(result.id);
   }
 
   // Context menu + interrogation for session images
@@ -1969,8 +1991,15 @@
     <!-- Agent chat column (desktop only) -->
     {#if !mobileFriendly}
       {#if chatOpen}
-        <div class="shrink-0 h-full overflow-hidden" style="width: 340px">
-          <ChatPanel />
+        <div class="shrink-0 h-full overflow-hidden flex flex-col" style="width: 360px">
+          <div class="flex-1 min-h-0 overflow-hidden">
+            <ChatPanel />
+          </div>
+          {#if results.results.length > 0 || results.pending.length > 0}
+            <div class="h-[44%] min-h-0 shrink-0 overflow-hidden border-t border-neutral-800">
+              <ResultBoard onFixHand={fixHandFromResult} />
+            </div>
+          {/if}
         </div>
         <div class="relative shrink-0 flex flex-col items-center">
           <div class="w-1 flex-1 bg-neutral-800"></div>

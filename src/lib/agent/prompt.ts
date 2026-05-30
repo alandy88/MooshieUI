@@ -21,15 +21,36 @@ export interface ProfileChoice {
   workflowId: string;
 }
 
+/** A Result already on the board, for the refine context (Phase 4). */
+export interface BoardEntry {
+  /** Board display number — what the operator and agent reference (`#3`). */
+  number: number;
+  /** Short intent/label, if known. */
+  intent: string | null;
+  /** Effective seed the Result was produced with. */
+  seed: number;
+}
+
+/** The current board state passed into a refine turn's system prompt. */
+export interface BoardContext {
+  entries: BoardEntry[];
+  /** The board number the operator has selected, if any (refine default). */
+  activeNumber: number | null;
+}
+
 /**
  * Build the system prompt for an intent→Spec turn. `profiles` is the catalog the
- * agent must pick from; the first entry is treated as the default.
+ * agent must pick from; the first entry is treated as the default. When `board`
+ * carries Results, the prompt also explains how to *refine* one (emit a delta
+ * that references a board number via `parent`).
  */
-export function buildSystemPrompt(profiles: ProfileChoice[]): string {
+export function buildSystemPrompt(profiles: ProfileChoice[], board?: BoardContext): string {
   const profileLines = profiles.length
     ? profiles.map((p) => `  - "${p.id}" — ${p.name} (workflow: ${p.workflowId})`).join("\n")
     : '  - "default" — Default';
   const defaultId = profiles[0]?.id ?? "default";
+
+  const refineSection = buildRefineSection(board);
 
   return `You are the generation agent for an anime image-generation studio (ComfyUI backend, Danbooru-tag prompting). Your job is to turn the operator's natural-language intent into a concrete generation request.
 
@@ -58,7 +79,38 @@ Request Spec fields (all optional except \`profile\`; omit anything you are not 
 Guidance:
 - Portraits: prefer a tall frame (e.g. 832×1216). Landscapes/scenes: a wide frame (e.g. 1216×832). Otherwise leave dimensions out.
 - Use seed -1 (or omit) unless the operator asked to fix or reuse a seed.
-- Keep negatives light; the Profile already carries quality/negative defaults.`;
+- Keep negatives light; the Profile already carries quality/negative defaults.${refineSection}`;
+}
+
+/**
+ * The refine block, appended only when the board has Results. It teaches the
+ * agent to emit a *delta* against a prior Result: set `parent` to the board
+ * number, and include ONLY the fields that change. Omitted fields inherit the
+ * referenced Result (not the Profile), so "like #3 but warmer" keeps #3's
+ * composition and seed; "再来4张" sets `sampling.seed` to -1 and `dimensions.batch`.
+ */
+function buildRefineSection(board?: BoardContext): string {
+  if (!board || board.entries.length === 0) return "";
+  const lines = board.entries
+    .map((e) => {
+      const active = e.number === board.activeNumber ? " (selected)" : "";
+      const label = e.intent ? ` — ${e.intent}` : "";
+      return `  - #${e.number}${active}: seed ${e.seed}${label}`;
+    })
+    .join("\n");
+  const activeHint = board.activeNumber
+    ? ` If the operator doesn't name one, assume #${board.activeNumber} (the selected Result).`
+    : "";
+
+  return `
+
+Results already on the board (refine these by reference):
+${lines}
+
+To REFINE a Result instead of starting fresh, set \`parent\` to its board number (e.g. "parent": "#3") and include ONLY the fields you are changing. Omitted fields inherit that Result — its composition, model, and seed — not the Profile defaults.${activeHint}
+- "like #3 but warmer" ⇒ { "parent": "#3", "subject": { "positive": "<#3's tags + warm lighting tags>" } }
+- "再来4张" / "4 more like this" ⇒ { "parent": "#<n>", "sampling": { "seed": -1 }, "dimensions": { "batch": 4 } }
+- Keep the same seed (only omit \`sampling.seed\`) when the operator wants the SAME image tweaked; roll a fresh seed (-1) when they want variations.`;
 }
 
 /** Result of extracting structured output from an agent reply. */

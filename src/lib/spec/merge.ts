@@ -122,6 +122,48 @@ export function mergeIntoResolved(
 }
 
 /**
+ * Apply a refine **delta** onto a parent Result's resolved Spec (Phase 4: the
+ * refine loop). Where a Profile merge expands a sparse request against reusable
+ * *Profile* defaults, a refine expands it against the *parent Result's own
+ * resolved Spec* — so "like #3 but warmer" inherits everything about #3 and
+ * changes only what the delta speaks to. The two share the same deep-merge rule;
+ * only the base differs (Profile defaults vs a concrete prior Result).
+ *
+ * Seed/cast inherit from the parent when the delta is silent (so "fix the hand"
+ * keeps the same composition); a delta that sets `sampling.seed` to -1 rolls
+ * fresh seeds ("再来4张"). Pin the parent Result's *effective* seed into
+ * `parentResolved.sampling.seed` before calling if you want bit-stable inherits —
+ * the Result carries the effective seed separately from its resolved Spec.
+ *
+ * `parent` is set from the delta (the Result being refined); `intent` is the new
+ * refine instruction (or null). Returns a new object; does not mutate the parent.
+ */
+export function applyRefineDelta(
+  parentResolved: ResolvedSpec,
+  delta: RequestSpec,
+): ResolvedSpec {
+  const refined = deepMerge(parentResolved, {
+    task: delta.task,
+    workflow: delta.workflow,
+    subject: delta.subject,
+    model: delta.model,
+    sampling: delta.sampling,
+    dimensions: delta.dimensions,
+    input: delta.input,
+    pipeline: delta.pipeline,
+  });
+
+  // cast inherits the parent's frame unless the delta replaces it wholesale.
+  refined.cast = delta.cast
+    ? delta.cast.map((c) => ({ ...c }))
+    : parentResolved.cast.map((c) => ({ ...c }));
+  refined.intent = delta.intent ?? null;
+  refined.parent = delta.parent ?? parentResolved.parent ?? null;
+
+  return refined;
+}
+
+/**
  * Strip the transient per-job fields from a ResolvedSpec to produce the reusable
  * defaults a saved Profile carries. The inverse half of the contract: nothing a
  * single job decided (`cast` / `seed` / `intent` / `parent`) leaks into the Profile.

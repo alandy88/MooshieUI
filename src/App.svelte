@@ -18,6 +18,7 @@
   import { generation } from "./lib/stores/generation.svelte.js";
   import { pipelineProfiles } from "./lib/stores/profiles.svelte.js";
   import { agent } from "./lib/stores/agent.svelte.js";
+  import { results } from "./lib/stores/results.svelte.js";
   import { autocomplete } from "./lib/stores/autocomplete.svelte.js";
   import { canvas } from "./lib/stores/canvas.svelte.js";
   import { accessibility } from "./lib/stores/accessibility.svelte.js";
@@ -1140,9 +1141,21 @@
     });
 
     gallery.addImages(newImages);
+    // Mint a Result per output image and close the pending board card (Phase 4).
+    const mintedResults = results.attachOutputs(promptId, newImages);
     progress.setLastOutputForMode(mode, newImages[0]?.url ?? null);
 
     const metadata = params ? buildPngMetadata(params) : undefined;
+    // Embed the resolved Spec + effective seed so the PNG re-opens as a fully
+    // reproducible Result (Phase 4 — Result contract; story #45). One Result per
+    // batch is embedded shared (mirrors the existing shared-seed metadata).
+    if (metadata && mintedResults[0]) {
+      metadata.mooshie_result = JSON.stringify({
+        resolvedSpec: mintedResults[0].resolvedSpec,
+        seed: mintedResults[0].seed,
+        parent: mintedResults[0].parent ?? null,
+      });
+    }
     for (const image of newImages) {
       image.metadata = metadata ?? null;
     }

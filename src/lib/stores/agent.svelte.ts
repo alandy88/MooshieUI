@@ -17,9 +17,10 @@
 import { ipcInvoke, ipcListen } from "../utils/ipc.js";
 import { pipelineProfiles, DEFAULT_PROFILE_ID } from "./profiles.svelte.js";
 import { generation } from "./generation.svelte.js";
-import { buildSystemPrompt, extractRequestSpec, type ProfileChoice } from "../agent/prompt.js";
+import { results } from "./results.svelte.js";
+import { buildSystemPrompt, extractRequestSpec, type ProfileChoice, type BoardContext } from "../agent/prompt.js";
 import { validateRequestSpec } from "../spec/validate.ts";
-import { mergeIntoResolved, profileDefaultsFromResolved, type RequestSpec } from "../spec/merge.ts";
+import { mergeIntoResolved, applyRefineDelta, profileDefaultsFromResolved, type RequestSpec } from "../spec/merge.ts";
 
 export type ChatRole = "user" | "assistant" | "note";
 
@@ -76,8 +77,16 @@ class AgentStore {
       name: p.name,
       workflowId: p.workflowId,
     }));
+    const board: BoardContext = {
+      entries: results.results.map((r, i) => ({
+        number: i + 1,
+        intent: r.resolvedSpec.intent,
+        seed: r.seed,
+      })),
+      activeNumber: results.activeResultId ? results.numberOf(results.activeResultId) : null,
+    };
     const wire = [
-      { role: "system", content: buildSystemPrompt(profiles) },
+      { role: "system", content: buildSystemPrompt(profiles, board) },
       ...this.messages
         .filter((m) => m.role === "user" || m.role === "assistant")
         .map((m) => ({ role: m.role, content: m.content })),
@@ -159,6 +168,28 @@ class AgentStore {
     }
 
     const request = spec as RequestSpec;
+
+    // Refine branch: a `parent` ref expands the delta against that Result's own
+    // resolved Spec (with its effective seed pinned), not a Profile (Phase 4).
+    if (request.parent) {
+      const parentId = this.resolveParentRef(request.parent);
+      const parentResult = parentId ? results.get(parentId) : undefined;
+      if (!parentResult) {
+        this.addNote(`Couldn't find Result "${request.parent}" to refine.`);
+        return;
+      }
+      const base = {
+        ...structuredClone(parentResult.resolvedSpec),
+        sampling: { ...parentResult.resolvedSpec.sampling, seed: parentResult.seed },
+      };
+      const resolved = applyRefineDelta(base, { ...request, parent: parentId });
+      generation.applySpec(resolved);
+      results.stageRefine(parentId!, request.intent ?? null);
+      this.specApplied = true;
+      this.addNote(`Refining #${results.numberOf(parentId!)} — review and press Generate.`);
+      return;
+    }
+
     const profile = pipelineProfiles.get(request.profile);
     if (!profile) {
       this.addNote(`Unknown profile "${request.profile}".`);
@@ -174,20 +205,33 @@ class AgentStore {
         : profile.defaults;
     const resolved = mergeIntoResolved(base, request);
     generation.applySpec(resolved);
+    results.stageFresh(request.intent ?? null);
     this.specApplied = true;
     this.addNote("Spec applied to the controls — review and press Generate.");
+  }
+
+  /**
+   * Resolve a `parent` reference the agent emitted to a board Result id. Accepts
+   * a board number (`"#3"` or `"3"`) or a literal Result id; returns null when it
+   * matches no current board Result.
+   */
+  private resolveParentRef(ref: string): string | null {
+    const num = /^#?(\d+)$/.exec(ref.trim());
+    if (num) return results.idForNumber(Number(num[1]));
+    return results.get(ref) ? ref : null;
   }
 
   private addNote(content: string): void {
     this.messages.push({ id: this.nextId(), role: "note", content, streaming: false });
   }
 
-  /** Reset the conversation (e.g. a new Session). */
+  /** Reset the conversation AND the Result board (a new Session). */
   reset(): void {
     this.messages = [];
     this.status = "idle";
     this.specApplied = false;
     this.currentRequestId = null;
+    results.reset();
   }
 }
 

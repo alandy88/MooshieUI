@@ -13,6 +13,7 @@
   } from "../../utils/api.js";
   import { models } from "../../stores/models.svelte.js";
   import { gallery } from "../../stores/gallery.svelte.js";
+  import { results } from "../../stores/results.svelte.js";
   import { locale } from "../../stores/locale.svelte.js";
   import { promptPresets } from "../../stores/promptPresets.svelte.js";
   import { isBrowserMode } from "../../utils/ipc.js";
@@ -44,6 +45,10 @@
     if (result.queue_position != null && result.queue_total != null) {
       progress.updateQueuePosition(result.prompt_id, result.queue_position, result.queue_total);
     }
+    // Open a pending Result card so the board can route the live preview onto it
+    // and mint a Result when the image lands (Phase 4 — Result board).
+    const spec = generation.toSpec();
+    results.recordSubmission(result.prompt_id, spec, result.seed, spec.intent);
     return result.prompt_id;
   }
 
