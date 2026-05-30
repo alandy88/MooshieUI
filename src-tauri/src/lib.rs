@@ -341,6 +341,7 @@ pub fn run() {
             });
         })
         .invoke_handler(tauri::generate_handler![
+            commands::agent::agent_chat,
             commands::server::start_comfyui,
             commands::server::stop_comfyui,
             commands::server::kill_port_process,

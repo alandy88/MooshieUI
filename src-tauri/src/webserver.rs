@@ -1585,6 +1585,17 @@ async fn dispatch_command(
     username: Option<&str>,
 ) -> Result<serde_json::Value, String> {
     match command {
+        // --- Agent ---
+        "agent_chat" => {
+            let messages: Vec<crate::commands::agent::ChatMessage> =
+                serde_json::from_value(args["messages"].clone())
+                    .map_err(|e| format!("Invalid messages: {}", e))?;
+            let request_id = args["request_id"].as_str().unwrap_or_default().to_string();
+            crate::commands::agent::run_agent_chat(&state, messages, request_id)
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(serde_json::json!(null))
+        }
         // --- Config ---
         "get_config" => {
             let config = state.config.read().await;

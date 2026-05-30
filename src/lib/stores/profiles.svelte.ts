@@ -21,6 +21,15 @@ import { getWorkflow } from "../workflows/registry.ts";
 
 const PROFILES_KEY = "pipeline-profiles";
 
+/**
+ * Id of the auto-seeded baseline Profile. It exists so the Agent always has a
+ * Profile to reference and so the catalog is never empty; its defaults mirror a
+ * reasonable starting pipeline. The Agent layer treats it specially — a request
+ * against it merges onto the *current* control-panel state, not this snapshot,
+ * so chat never clobbers the operator's manual edits (dual-surface principle).
+ */
+export const DEFAULT_PROFILE_ID = "default";
+
 export interface PipelineProfile {
   /** Stable id (also the `profile` ref a RequestSpec carries). */
   id: string;
@@ -61,6 +70,16 @@ class PipelineProfileStore {
   /** Look up a Profile by id. */
   get(id: string): PipelineProfile | undefined {
     return this.profiles.find((p) => p.id === id);
+  }
+
+  /**
+   * Seed the baseline `default` Profile from a ResolvedSpec if it does not yet
+   * exist (transient fields are stripped by `saveSpecAsProfile`). No-op once
+   * seeded, so it never overwrites an operator-edited default.
+   */
+  async ensureDefault(resolved: ResolvedSpec): Promise<void> {
+    if (this.get(DEFAULT_PROFILE_ID)) return;
+    await this.saveSpecAsProfile(DEFAULT_PROFILE_ID, "Default", "txt2img", resolved);
   }
 
   /** Insert or replace a Profile (matched by id), then persist. */

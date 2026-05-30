@@ -1,3 +1,4 @@
+pub mod agent;
 pub mod api;
 #[cfg(feature = "desktop")]
 pub mod config;

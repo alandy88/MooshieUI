@@ -77,6 +77,13 @@ pub struct AppConfig {
     /// Optional PyPI index URL for pip/uv installs (e.g. a regional mirror).
     /// Example: `https://pypi.tuna.tsinghua.edu.cn/simple`
     pub pip_index_url: Option<String>,
+    /// Base URL of the OpenAI-compatible agent runtime (intent→Spec / judge).
+    /// Should include the API prefix, e.g. `http://llm.lif.home/v1`.
+    pub agent_base_url: String,
+    /// Optional API key for the agent runtime (LAN models usually need none).
+    pub agent_api_key: Option<String>,
+    /// Model name the agent runtime should route to (e.g. llama-swap profile name).
+    pub agent_model: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -123,6 +130,9 @@ impl Default for AppConfig {
             gpu_workers: vec![],
             network_proxy: None,
             pip_index_url: None,
+            agent_base_url: "http://llm.lif.home/v1".to_string(),
+            agent_api_key: None,
+            agent_model: "default".to_string(),
         }
     }
 }

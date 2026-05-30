@@ -166,6 +166,12 @@ export interface AppConfig {
   network_proxy: string | null;
   /** PyPI index URL for pip/uv installs, e.g. a regional mirror (optional). */
   pip_index_url: string | null;
+  /** Base URL of the OpenAI-compatible agent runtime, including the API prefix (e.g. http://llm.lif.home/v1). */
+  agent_base_url: string;
+  /** Optional API key for the agent runtime (LAN models usually need none). */
+  agent_api_key: string | null;
+  /** Model name the agent runtime should route to (e.g. llama-swap profile name). */
+  agent_model: string;
 }
 
 export interface QueueInfo {

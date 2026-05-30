@@ -16,6 +16,8 @@
   import { getOutputImage, uploadImageBytes, getConfig, readImageMetadata, getQueue, recoverPromptOutputs, readTempImage } from "./lib/utils/api.js";
   import { loadOutputImageForGenerationInput, uploadOutputImageForGenerationInput } from "./lib/utils/galleryActions.js";
   import { generation } from "./lib/stores/generation.svelte.js";
+  import { pipelineProfiles } from "./lib/stores/profiles.svelte.js";
+  import { agent } from "./lib/stores/agent.svelte.js";
   import { autocomplete } from "./lib/stores/autocomplete.svelte.js";
   import { canvas } from "./lib/stores/canvas.svelte.js";
   import { accessibility } from "./lib/stores/accessibility.svelte.js";
@@ -1561,6 +1563,12 @@
 
     // Load persisted settings
     await Promise.all([generation.loadSettings(), autocomplete.loadSettings(), locale.loadSettings()]);
+
+    // Agent layer (Phase 3): load Pipeline Profiles, seed the baseline default
+    // from current generation state, and register the chat streaming listeners.
+    await pipelineProfiles.load();
+    await pipelineProfiles.ensureDefault(generation.toSpec());
+    void agent.init();
 
     // Set up event listeners BEFORE starting so we don't miss events
     await Promise.all([

@@ -8,6 +8,7 @@
   import SamplerSettings from "./SamplerSettings.svelte";
   import DimensionControls from "./DimensionControls.svelte";
   import GenerateButton from "./GenerateButton.svelte";
+  import ChatPanel from "../agent/ChatPanel.svelte";
   import UpscaleSettings from "./UpscaleSettings.svelte";
   import FaceFixSettings from "./FaceFixSettings.svelte";
   import ControlNetSettings from "./ControlNetSettings.svelte";
@@ -798,6 +799,15 @@
   let leftCollapsed = $state(false);
   let rightCollapsed = $state(false);
   let bottomCollapsed = $state(false);
+
+  // Agent chat column (desktop only) — persisted open/closed state.
+  const CHAT_OPEN_KEY = `mooshieui.generation.chat.open.v1${storageSuffix}`;
+  let chatOpen = $state(
+    typeof window !== "undefined" && localStorage.getItem(CHAT_OPEN_KEY) === "true",
+  );
+  $effect(() => {
+    try { localStorage.setItem(CHAT_OPEN_KEY, String(chatOpen)); } catch {}
+  });
 
   // Store pre-collapse widths/heights so we can restore them
   let leftWidthBeforeCollapse = LEFT_DEFAULT;
@@ -1956,6 +1966,35 @@
     onmouseup={onPointerUp}
     onmouseleave={onPointerUp}
   >
+    <!-- Agent chat column (desktop only) -->
+    {#if !mobileFriendly}
+      {#if chatOpen}
+        <div class="shrink-0 h-full overflow-hidden" style="width: 340px">
+          <ChatPanel />
+        </div>
+        <div class="relative shrink-0 flex flex-col items-center">
+          <div class="w-1 flex-1 bg-neutral-800"></div>
+          <button
+            onclick={() => (chatOpen = false)}
+            class="absolute top-1/2 -translate-y-1/2 left-0 z-20 w-6 h-12 flex items-center justify-center rounded-r border border-l-0 bg-neutral-800 border-neutral-700 text-neutral-400 hover:text-neutral-200 hover:bg-neutral-700 transition-colors"
+            title="Hide agent"
+            aria-label="Hide agent"
+          >
+            <svg xmlns="http://www.w3.org/2000/svg" class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"/></svg>
+          </button>
+        </div>
+      {:else}
+        <button
+          onclick={() => (chatOpen = true)}
+          class="shrink-0 w-7 h-full flex items-start justify-center pt-3 border-r border-neutral-800 text-neutral-400 hover:text-neutral-200 hover:bg-neutral-800/50 transition-colors"
+          title="Show agent"
+          aria-label="Show agent"
+        >
+          <svg xmlns="http://www.w3.org/2000/svg" class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+        </button>
+      {/if}
+    {/if}
+
     {#if mobileFriendly}
       <div class="fixed top-2 left-1/2 -translate-x-1/2 z-50 w-[min(96vw,34rem)] px-2">
         <div class="w-full flex gap-1 bg-neutral-900 rounded-lg p-1 border border-neutral-700 shadow">

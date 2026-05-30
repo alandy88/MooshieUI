@@ -2638,6 +2638,62 @@
         </section>
         {/if}
 
+        <!-- Agent runtime (admin / moderator) -->
+        {#if canManageServer}
+        <section class="bg-neutral-900 rounded-xl border border-neutral-800 overflow-hidden break-inside-avoid mb-4">
+          <button
+            class="w-full flex items-center justify-between p-5 text-sm font-medium text-neutral-200 hover:bg-neutral-800/50 transition-colors cursor-pointer"
+            onclick={() => (collapsed.agent = !collapsed.agent)}
+          >
+            <span class="flex items-center gap-2">
+              <svg xmlns="http://www.w3.org/2000/svg" class="w-4 h-4 text-indigo-400" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+              Agent
+            </span>
+            <svg xmlns="http://www.w3.org/2000/svg" class="w-4 h-4 text-neutral-500 transition-transform {collapsed.agent ? '' : 'rotate-180'}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>
+          </button>
+
+          {#if !collapsed.agent}
+          <div class="px-5 pb-5 space-y-3">
+            <p class="text-[10px] text-neutral-500">OpenAI-compatible runtime the chat agent calls to turn intent into a generation Spec.</p>
+            <div>
+              <label class="text-xs text-neutral-400 block mb-1">Base URL</label>
+              <input
+                type="text"
+                value={config.agent_base_url ?? ""}
+                oninput={(e) => { if (config) config.agent_base_url = (e.target as HTMLInputElement).value; }}
+                onchange={() => { autoSave(); }}
+                placeholder="http://llm.lif.home/v1"
+                class="w-full bg-neutral-800 border border-neutral-700 rounded-lg px-3 py-2 text-sm text-neutral-100 placeholder-neutral-500 focus:outline-none focus:border-indigo-500 transition-colors font-mono"
+              />
+              <p class="text-[10px] text-neutral-500 mt-1">Include the API prefix (e.g. <code>/v1</code>). The client posts to <code>{"{base}"}/chat/completions</code>.</p>
+            </div>
+            <div>
+              <label class="text-xs text-neutral-400 block mb-1">Model</label>
+              <input
+                type="text"
+                value={config.agent_model ?? ""}
+                oninput={(e) => { if (config) config.agent_model = (e.target as HTMLInputElement).value; }}
+                onchange={() => { autoSave(); }}
+                placeholder="default"
+                class="w-full bg-neutral-800 border border-neutral-700 rounded-lg px-3 py-2 text-sm text-neutral-100 placeholder-neutral-500 focus:outline-none focus:border-indigo-500 transition-colors font-mono"
+              />
+            </div>
+            <div>
+              <label class="text-xs text-neutral-400 block mb-1">API key (optional)</label>
+              <input
+                type="password"
+                value={config.agent_api_key ?? ""}
+                oninput={(e) => { if (config) { const v = (e.target as HTMLInputElement).value.trim(); config.agent_api_key = v || null; } }}
+                onchange={() => { autoSave(); }}
+                placeholder="(none for LAN models)"
+                class="w-full bg-neutral-800 border border-neutral-700 rounded-lg px-3 py-2 text-sm text-neutral-100 placeholder-neutral-500 focus:outline-none focus:border-indigo-500 transition-colors font-mono"
+              />
+            </div>
+          </div>
+          {/if}
+        </section>
+        {/if}
+
         <!-- Account / Change Password (browser mode non-admin users) -->
         {#if isBrowserMode && !isAdmin}
         <section class="bg-neutral-900 rounded-xl border border-neutral-800 overflow-hidden break-inside-avoid mb-4">
